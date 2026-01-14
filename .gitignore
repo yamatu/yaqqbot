@@ -1,0 +1,8 @@
+qqbot.log
+user_memory.json
+nginx_servers.json
+__pycache__/
+*.pyc
+
+# 本地敏感配置（包含 API Key），仅保留示例文件到仓库
+configs/config.json

@@ -1,0 +1,17 @@
+{
+  "token": "请填写你的 TOKEN（如需）",
+  "claude_api_key": "YOUR_CLAUDE_API_KEY",
+  "claude_api_base": "https://agentrouter.org",
+  "claude_model": "claude-sonnet-4-5-20250929",
+  "gpt_api_key": "YOUR_GPT_API_KEY",
+  "gpt_api_base": "https://codex-api.packycode.com/v1",
+  "gpt_model": "gpt-5.1",
+  "grok_api_key": "YOUR_GROK_API_KEY",
+  "grok_api_base": "https://happyapi.org/v1",
+  "grok_model": "grok-3",
+  "amap_api_key": "你的高德Key",
+  "bilibili_api_base": "https://api.bilibili.com/x/web-interface/view",
+  "packycode_userinfo_url": "https://codex.packycode.com/api/backend/users/info",
+  "packycode_user_jwt": "你的 JWT（如需）",
+  "socks5_proxy": "socks5://127.0.0.1:41457"
+}
