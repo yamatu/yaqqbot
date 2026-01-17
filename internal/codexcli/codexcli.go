@@ -41,6 +41,9 @@ type ExecOptions struct {
 
 	// 输出超时保护
 	Timeout time.Duration
+
+	// 附加到初始 prompt 的图片绝对路径（等价于 `codex exec --image <FILE>`，可多张）
+	Images []string
 }
 
 func (o ExecOptions) withDefaults() ExecOptions {
@@ -75,6 +78,7 @@ type execCaps struct {
 	hasModel             bool
 	hasOutputLastMessage bool
 	hasConfig            bool
+	hasImage             bool
 }
 
 type rootCaps struct {
@@ -112,6 +116,7 @@ func detectCaps(ctx context.Context, bin string) (rootCaps, execCaps) {
 		hasOutputLastMessage: strings.Contains(helpExec, "--output-last-message"),
 		// 兼容：有些版本把 --config 作为全局参数；但也可能在 exec 中标记为 global
 		hasConfig: strings.Contains(helpExec, "--config") || strings.Contains(helpRoot, "--config"),
+		hasImage:  strings.Contains(helpExec, "--image"),
 	}
 	return rc, ec
 }
@@ -220,6 +225,15 @@ func Exec(ctx context.Context, prompt string, opts ExecOptions) (string, error) 
 
 	if execCaps.hasColor {
 		execArgs = append(execArgs, "--color", "never")
+	}
+	if execCaps.hasImage && len(opts.Images) > 0 {
+		for _, p := range opts.Images {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			execArgs = append(execArgs, "--image", p)
+		}
 	}
 	// sandbox 优先使用全局；全局不支持时才放到 exec
 	if !rootCaps.hasSandbox && execCaps.hasSandbox {

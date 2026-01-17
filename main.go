@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 
@@ -131,12 +132,86 @@ type cqMessage struct {
 type wsClient struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
+
+	pendingMu sync.Mutex
+	pending   map[string]chan []byte
 }
 
 func (c *wsClient) WriteJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.WriteJSON(v)
+}
+
+var wsEchoSeq uint64
+
+type oneBotActionResp struct {
+	Status  string          `json:"status"`
+	Retcode int             `json:"retcode"`
+	Data    json.RawMessage `json:"data"`
+	Msg     string          `json:"msg"`
+	Wording string          `json:"wording"`
+	Echo    string          `json:"echo"`
+}
+
+func (c *wsClient) Call(ctx context.Context, action string, params map[string]any) (json.RawMessage, error) {
+	echo := fmt.Sprintf("e-%d", atomic.AddUint64(&wsEchoSeq, 1))
+	ch := make(chan []byte, 1)
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[string]chan []byte)
+	}
+	c.pending[echo] = ch
+	c.pendingMu.Unlock()
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, echo)
+		c.pendingMu.Unlock()
+	}()
+
+	req := map[string]any{
+		"action": action,
+		"params": params,
+		"echo":   echo,
+	}
+	if err := c.WriteJSON(req); err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case b := <-ch:
+		var resp oneBotActionResp
+		if err := json.Unmarshal(b, &resp); err != nil {
+			return nil, err
+		}
+		if resp.Status != "ok" || resp.Retcode != 0 {
+			msg := strings.TrimSpace(resp.Wording)
+			if msg == "" {
+				msg = strings.TrimSpace(resp.Msg)
+			}
+			if msg == "" {
+				msg = fmt.Sprintf("status=%s retcode=%d", resp.Status, resp.Retcode)
+			}
+			return nil, errors.New(msg)
+		}
+		return resp.Data, nil
+	}
+}
+
+func (c *wsClient) fulfillEcho(echo string, payload []byte) bool {
+	c.pendingMu.Lock()
+	ch := c.pending[echo]
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- payload:
+	default:
+	}
+	return true
 }
 
 // QQBot 主结构
@@ -169,6 +244,8 @@ type qqBotServer struct {
 
 	// 正则
 	reCQ            *regexp.Regexp
+	reCQImage       *regexp.Regexp
+	reCQReply       *regexp.Regexp
 	reBV            *regexp.Regexp
 	reBilibiliURL   *regexp.Regexp
 	reBilibiliShort *regexp.Regexp
@@ -339,6 +416,9 @@ func newQQBotServer() *qqBotServer {
 
 	// 编译正则
 	reCQ := regexp.MustCompile(`\[CQ:[^\]]+\]`)
+	// image/mface 都可能携带图片；mface 在部分实现中可能单独作为 CQ 段类型上报。
+	reCQImage := regexp.MustCompile(`\[CQ:(?:image|mface),([^\]]+)\]`)
+	reCQReply := regexp.MustCompile(`\[CQ:reply,([^\]]+)\]`)
 	reBV := regexp.MustCompile(`BV[a-zA-Z0-9]{10}`)
 	reBilibiliURL := regexp.MustCompile(`(https?://)?((www|m)\.)?bilibili\.com/video/(BV[a-zA-Z0-9]{10})`)
 	reBilibiliShort := regexp.MustCompile(`https?://b23\.tv/[0-9A-Za-z]+`)
@@ -371,6 +451,8 @@ func newQQBotServer() *qqBotServer {
 		httpClient:       newHTTPClient(),
 		proxyClient:      newProxyHTTPClient(),
 		reCQ:             reCQ,
+		reCQImage:        reCQImage,
+		reCQReply:        reCQReply,
 		reBV:             reBV,
 		reBilibiliURL:    reBilibiliURL,
 		reBilibiliShort:  reBilibiliShort,
@@ -1836,7 +1918,7 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
-func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
+func (b *qqBotServer) callGPTAPI(messages []chatMessage, imagePaths []string) string {
 	if gptAPIKey == "" {
 		return "❌ GPT 未配置 API Key"
 	}
@@ -1845,8 +1927,8 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 
 	// 特殊处理：codex-api.packycode.com 明确限制“仅允许官方 Codex CLI 访问”。
 	// 这里不尝试伪装/绕过，而是直接调用本机 Codex CLI 来完成对话（需要你已安装并登录/配置）。
-	if strings.Contains(strings.ToLower(apiBase), "codex-api.packycode.com") {
-		prompt := buildConversationPrompt(messages)
+	if len(imagePaths) > 0 || strings.Contains(strings.ToLower(apiBase), "codex-api.packycode.com") {
+		prompt := buildConversationPrompt(messages, len(imagePaths))
 		out, err := codexcli.Exec(context.Background(), prompt, codexcli.ExecOptions{
 			Bin:     envOrDefault("CODEX_CLI_BIN", "codex"),
 			Model:   gptModel,
@@ -1854,6 +1936,7 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 			APIKey:  gptAPIKey,
 			EnvKey:  "GPT_API_KEY",
 			WireAPI: envOrDefault("CODEX_WIRE_API", "responses"),
+			Images:  imagePaths,
 			SkipGitRepoCheck: func() *bool {
 				v := envBoolOrDefault("CODEX_SKIP_GIT_REPO_CHECK", true)
 				return &v
@@ -1965,9 +2048,12 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 
 // buildConversationPrompt 把 messages 组装成适合“纯对话”的文本提示，供 codex exec 使用。
 // 约束：不引导其修改文件或执行命令，避免产生副作用。
-func buildConversationPrompt(messages []chatMessage) string {
+func buildConversationPrompt(messages []chatMessage, imageCount int) string {
 	var b strings.Builder
-	b.WriteString("你是聊天助手。请不要执行任何命令、不要读写文件、不要修改仓库，只需要回答用户的最后一个问题。\n\n")
+	if imageCount > 0 {
+		b.WriteString(fmt.Sprintf("你是聊天助手。你将收到 %d 张图片作为附件（由系统通过 --image 提供）。请结合图片内容与对话历史回答。\n", imageCount))
+	}
+	b.WriteString("请不要执行任何命令、不要读写文件、不要修改仓库，只需要回答用户的最后一个问题。\n\n")
 	for _, m := range messages {
 		role := strings.TrimSpace(m.Role)
 		content := strings.TrimSpace(m.Content)
@@ -2102,6 +2188,273 @@ func (b *qqBotServer) stripCQCodes(message string) string {
 	return strings.TrimSpace(b.reCQ.ReplaceAllString(message, ""))
 }
 
+// saveIncomingImages 会从 raw CQ message 中提取图片段并保存到本机临时目录，
+// 返回可供 Codex CLI `--image` 使用的绝对路径列表。
+func (b *qqBotServer) saveIncomingImages(rawMsg string) ([]string, func()) {
+	matches := b.reCQImage.FindAllStringSubmatch(rawMsg, -1)
+	if len(matches) == 0 {
+		return nil, func() {}
+	}
+
+	var paths []string
+	var created []string
+
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		params := parseCQKVParams(m[1])
+		srcURL := strings.TrimSpace(params["url"])
+		file := strings.TrimSpace(params["file"])
+
+		switch {
+		case strings.HasPrefix(srcURL, "http://") || strings.HasPrefix(srcURL, "https://"):
+			p, err := b.downloadImageToTemp(srcURL)
+			if err != nil {
+				b.logger.Printf("下载图片失败: %v", err)
+				continue
+			}
+			paths = append(paths, p)
+			created = append(created, p)
+		case strings.HasPrefix(file, "base64://"):
+			p, err := writeBase64ImageToTemp(file)
+			if err != nil {
+				b.logger.Printf("保存 base64 图片失败: %v", err)
+				continue
+			}
+			paths = append(paths, p)
+			created = append(created, p)
+		default:
+			// 兜底：若 file 本身就是本机绝对路径且存在，则直接传给 codex。
+			if filepath.IsAbs(file) {
+				if st, err := os.Stat(file); err == nil && !st.IsDir() {
+					paths = append(paths, file)
+				}
+			}
+		}
+	}
+
+	cleanup := func() {
+		for _, p := range created {
+			_ = os.Remove(p)
+		}
+	}
+	return paths, cleanup
+}
+
+func parseCQKVParams(s string) map[string]string {
+	out := make(map[string]string)
+	parts := strings.Split(s, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = cqUnescape(strings.TrimSpace(v))
+	}
+	return out
+}
+
+// cqUnescape 实现 go-cqhttp/OneBot v11 CQ 码转义的逆变换：
+// &amp; &#91; &#93; &#44;
+func cqUnescape(s string) string {
+	s = strings.ReplaceAll(s, "&#44;", ",")
+	s = strings.ReplaceAll(s, "&#91;", "[")
+	s = strings.ReplaceAll(s, "&#93;", "]")
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	return s
+}
+
+func imageExtFromContentType(ct string) string {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if idx := strings.Index(ct, ";"); idx != -1 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	switch ct {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	default:
+		return ".img"
+	}
+}
+
+func writeBytesToTempImage(data []byte, ext string) (string, error) {
+	if ext == "" || !strings.HasPrefix(ext, ".") {
+		ext = ".img"
+	}
+	dir := filepath.Join(os.TempDir(), "yaqqbot-images")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, "qqimg-*"+ext)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func decodeBase64Any(s string) ([]byte, error) {
+	// 常见：StdEncoding / RawStdEncoding / URLEncoding
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.RawURLEncoding.DecodeString(s)
+}
+
+func writeBase64ImageToTemp(fileField string) (string, error) {
+	b64 := strings.TrimPrefix(fileField, "base64://")
+	data, err := decodeBase64Any(b64)
+	if err != nil {
+		return "", err
+	}
+	ct := http.DetectContentType(data)
+	return writeBytesToTempImage(data, imageExtFromContentType(ct))
+}
+
+func (b *qqBotServer) downloadImageToTemp(srcURL string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+	client := b.proxyClient
+	if client == nil {
+		client = b.httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status=%d", resp.StatusCode)
+	}
+	// 避免意外大文件拖垮进程
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+	if err != nil {
+		return "", err
+	}
+	ext := imageExtFromContentType(resp.Header.Get("Content-Type"))
+	if ext == ".img" {
+		// 兜底：按内容嗅探
+		ext = imageExtFromContentType(http.DetectContentType(data))
+	}
+	return writeBytesToTempImage(data, ext)
+}
+
+func (b *qqBotServer) extractReplyMessageID(rawMsg string) (int64, bool) {
+	m := b.reCQReply.FindStringSubmatch(rawMsg)
+	if len(m) < 2 {
+		return 0, false
+	}
+	params := parseCQKVParams(m[1])
+	idStr := strings.TrimSpace(params["id"])
+	if idStr == "" {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+// saveIncomingImagesFromOneBotMessage 支持从 get_msg 的 message 字段中提取图片。
+// message 可能是 CQ 字符串，也可能是 OneBot 消息段数组（[]）。
+func (b *qqBotServer) saveIncomingImagesFromOneBotMessage(message any) ([]string, func()) {
+	switch v := message.(type) {
+	case nil:
+		return nil, func() {}
+	case string:
+		return b.saveIncomingImages(v)
+	case []any:
+		var paths []string
+		var created []string
+
+		for _, segAny := range v {
+			seg, ok := segAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := seg["type"].(string)
+			if typ != "image" && typ != "mface" {
+				continue
+			}
+			data, ok := seg["data"].(map[string]any)
+			if !ok {
+				continue
+			}
+			urlStr, _ := data["url"].(string)
+			fileStr, _ := data["file"].(string)
+			urlStr = strings.TrimSpace(cqUnescape(urlStr))
+			fileStr = strings.TrimSpace(cqUnescape(fileStr))
+
+			switch {
+			case strings.HasPrefix(urlStr, "http://") || strings.HasPrefix(urlStr, "https://"):
+				p, err := b.downloadImageToTemp(urlStr)
+				if err != nil {
+					continue
+				}
+				paths = append(paths, p)
+				created = append(created, p)
+			case strings.HasPrefix(fileStr, "base64://"):
+				p, err := writeBase64ImageToTemp(fileStr)
+				if err != nil {
+					continue
+				}
+				paths = append(paths, p)
+				created = append(created, p)
+			default:
+				if filepath.IsAbs(fileStr) {
+					if st, err := os.Stat(fileStr); err == nil && !st.IsDir() {
+						paths = append(paths, fileStr)
+					}
+				}
+			}
+		}
+
+		cleanup := func() {
+			for _, p := range created {
+				_ = os.Remove(p)
+			}
+		}
+		return paths, cleanup
+	default:
+		// 兜底：尝试把 message 序列化成字符串再走 CQ 解析
+		if bts, err := json.Marshal(v); err == nil {
+			return b.saveIncomingImages(string(bts))
+		}
+		return nil, func() {}
+	}
+}
+
 func (b *qqBotServer) sendLongText(client *wsClient, messageType string, targetID int64, text string) {
 	if text == "" {
 		return
@@ -2165,6 +2518,8 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 
 	cleanMsg := b.stripCQCodes(rawMsg)
 	isAtMe := msgType == "group" && strings.Contains(rawMsg, "[CQ:at,qq="+selfID+"]")
+	hasImage := b.reCQImage.MatchString(rawMsg)
+	replyMsgID, hasReply := b.extractReplyMessageID(rawMsg)
 
 	var responseText string
 	var responseImg string
@@ -2309,7 +2664,53 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			prompt = strings.TrimSpace(regexp.MustCompile(`@\d+\s*`).ReplaceAllString(cleanMsg, ""))
 		}
 	}
-	if shouldChat && prompt != "" {
+
+	imagePaths := []string(nil)
+	cleanups := []func(){}
+	if shouldChat {
+		// 1) 当前消息内的图片（CQ:image / CQ:mface）
+		if hasImage {
+			if paths, cleanup := b.saveIncomingImages(rawMsg); len(paths) > 0 {
+				imagePaths = append(imagePaths, paths...)
+				cleanups = append(cleanups, cleanup)
+			}
+		}
+
+		// 2) 群聊：当“@机器人 + 引用(reply)”时，尝试从被引用消息中提取图片。
+		// 说明：OneBot 的 reply 段只带 message_id，本条消息 raw_message 不一定包含图片段。
+		if msgType == "group" && isAtMe && hasReply && replyMsgID > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			data, err := client.Call(ctx, "get_msg", map[string]any{"message_id": replyMsgID})
+			cancel()
+			if err != nil {
+				b.logger.Printf("get_msg 失败（message_id=%d）: %v", replyMsgID, err)
+			} else {
+				var d struct {
+					Message any `json:"message"`
+				}
+				if err := json.Unmarshal(data, &d); err == nil {
+					if paths, cleanup := b.saveIncomingImagesFromOneBotMessage(d.Message); len(paths) > 0 {
+						imagePaths = append(imagePaths, paths...)
+						cleanups = append(cleanups, cleanup)
+					}
+				}
+			}
+		}
+	}
+	if len(cleanups) > 0 {
+		defer func() {
+			for _, fn := range cleanups {
+				fn()
+			}
+		}()
+	}
+
+	hasAnyImage := len(imagePaths) > 0
+	if shouldChat && strings.TrimSpace(prompt) == "" && hasAnyImage {
+		prompt = "请描述图片内容，并结合上下文回答我的问题。"
+	}
+
+	if shouldChat && strings.TrimSpace(prompt) != "" {
 		groupIDPtr := (*string)(nil)
 		if groupID != "" {
 			groupIDPtr = &groupID
@@ -2317,6 +2718,10 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		modelKey := tempModel
 		if modelKey == "" {
 			modelKey = b.getUserModel(userID, groupIDPtr)
+		}
+		// 图片输入目前仅对 GPT(Codex CLI) 做了适配；避免 Claude/Grok 丢失图片信息。
+		if hasAnyImage {
+			modelKey = "gpt"
 		}
 		systemPrompt := b.modelPrompts[modelKey]
 		if systemPrompt == "" {
@@ -2344,9 +2749,18 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		case "grok":
 			ans = b.callGrokAPI(msgs)
 		default:
-			ans = b.callGPTAPI(msgs)
+			ans = b.callGPTAPI(msgs, imagePaths)
 		}
-		b.appendHistory(userID, "user", prompt)
+		// 记忆中不保存绝对路径，避免泄露本机路径细节。
+		memPrompt := prompt
+		if hasAnyImage {
+			if len(imagePaths) > 0 {
+				memPrompt = memPrompt + fmt.Sprintf("\n[用户发送了 %d 张图片]", len(imagePaths))
+			} else {
+				memPrompt = memPrompt + "\n[用户发送了图片]"
+			}
+		}
+		b.appendHistory(userID, "user", memPrompt)
 		b.appendHistory(userID, "assistant", ans)
 		responseText = fmt.Sprintf("🤖 [%s]\n%s", modelKey, ans)
 	}
@@ -2380,7 +2794,7 @@ func (b *qqBotServer) clientHandler(w http.ResponseWriter, r *http.Request) {
 		b.logger.Printf("WebSocket 握手失败: %v", err)
 		return
 	}
-	client := &wsClient{conn: conn}
+	client := &wsClient{conn: conn, pending: make(map[string]chan []byte)}
 	b.logger.Println("New Client Connected")
 	defer func() {
 		b.logger.Println("Client Disconnected")
@@ -2394,7 +2808,18 @@ func (b *qqBotServer) clientHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		// 每条消息单独 goroutine 处理，避免阻塞读取
+		// 兼容处理：同一条 WS 连接上既会收到事件，也会收到 action 的响应（带 echo）。
+		var hint struct {
+			Echo     string `json:"echo"`
+			PostType string `json:"post_type"`
+		}
+		if err := json.Unmarshal(data, &hint); err == nil && hint.Echo != "" && hint.PostType == "" {
+			if client.fulfillEcho(hint.Echo, data) {
+				continue
+			}
+		}
+
+		// 每条事件消息单独 goroutine 处理，避免阻塞读取
 		payload := make([]byte, len(data))
 		copy(payload, data)
 		go b.processSingleMessage(client, payload)
