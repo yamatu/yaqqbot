@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"net"
@@ -20,10 +24,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
-	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 
@@ -41,6 +45,7 @@ const (
 	memoryFile         = "user_memory.json"
 	groupSettingsKey   = "__group_settings__"
 	nginxServersFile   = "nginx_servers.json"
+	steamWatchFile     = "steam_watch.json"
 	messageChunkSize   = 4000
 	nginxStreamConfDir = "/etc/nginx/stream.conf.d"
 
@@ -73,6 +78,23 @@ var (
 	grokAPIBase = envOrDefault("GROK_API_BASE", "https://happyapi.org/v1")
 	grokModel   = envOrDefault("GROK_MODEL", "grok-3")
 
+	// Gemini API（用于图片生成）
+	geminiAPIKey     = os.Getenv("GEMINI_API_KEY")
+	geminiAPIBase    = envOrDefault("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta")
+	geminiImageModel = envOrDefault("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+
+	deepSeekAPIKey  = os.Getenv("DEEPSEEK_API_KEY")
+	deepSeekAPIBase = envOrDefault("DEEPSEEK_API_BASE", "https://api.deepseek.com")
+	deepSeekModel   = envOrDefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+	steamAPIKey          = os.Getenv("STEAM_API_KEY")
+	steamAPIBase         = envOrDefault("STEAM_API_BASE", "https://api.steampowered.com")
+	steamAPIKeyDomain    = envOrDefault("STEAM_API_KEY_DOMAIN", "book.yamatu.xyz")
+	steamMonitorGroups   = parseCSVEnv("STEAM_MONITOR_GROUPS")
+	steamPollInterval    = envDurationOrDefault("STEAM_POLL_INTERVAL", 60*time.Second)
+	longForwardThreshold = envIntOrDefault("LONG_FORWARD_THRESHOLD", 3000)
+	maxContextChars      = envIntOrDefault("MAX_CONTEXT_CHARS", 24000)
+
 	amapAPIKey      = os.Getenv("AMAP_API_KEY")
 	bilibiliAPIBase = envOrDefault("BILIBILI_API_BASE", "https://api.bilibili.com/x/web-interface/view")
 
@@ -82,9 +104,10 @@ var (
 
 // 提示词文件
 var promptFiles = map[string]string{
-	"grok":   "grok.txt",
-	"gpt":    "gpt.txt",
-	"claude": "claude.txt",
+	"grok":     "grok.txt",
+	"gpt":      "gpt.txt",
+	"claude":   "claude.txt",
+	"deepseek": "deepseek.txt",
 }
 
 // ============ 数据结构 ============
@@ -94,9 +117,17 @@ type historyItem struct {
 	Content string `json:"content"`
 }
 
+type userEvent struct {
+	Time    string `json:"time"`
+	Type    string `json:"type"`
+	GroupID string `json:"group_id,omitempty"`
+	Detail  string `json:"detail"`
+}
+
 type userProfile struct {
 	History []historyItem `json:"history"`
 	Model   string        `json:"model"`
+	Events  []userEvent   `json:"events,omitempty"`
 }
 
 type groupSettings struct {
@@ -122,10 +153,17 @@ type nginxConfigFile struct {
 type cqMessage struct {
 	PostType    string `json:"post_type"`
 	MessageType string `json:"message_type"`
+	NoticeType  string `json:"notice_type"`
+	SubType     string `json:"sub_type"`
+	RequestType string `json:"request_type"`
 	UserID      int64  `json:"user_id"`
+	TargetID    int64  `json:"target_id"`
+	OperatorID  int64  `json:"operator_id"`
 	GroupID     int64  `json:"group_id"`
 	RawMessage  string `json:"raw_message"`
 	SelfID      int64  `json:"self_id"`
+	MessageID   int64  `json:"message_id"`
+	Comment     string `json:"comment"`
 }
 
 // WebSocket 客户端封装，保证写操作串行。
@@ -152,6 +190,20 @@ type oneBotActionResp struct {
 	Msg     string          `json:"msg"`
 	Wording string          `json:"wording"`
 	Echo    string          `json:"echo"`
+}
+
+type steamWatchEntry struct {
+	SteamID      string `json:"steam_id"`
+	Name         string `json:"name"`
+	LastState    int    `json:"last_state"`
+	LastGameID   string `json:"last_game_id,omitempty"`
+	LastGameName string `json:"last_game_name,omitempty"`
+	GameStarted  string `json:"game_started,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
+}
+
+type steamWatchState struct {
+	Watched map[string]*steamWatchEntry `json:"watched"`
 }
 
 func (c *wsClient) Call(ctx context.Context, action string, params map[string]any) (json.RawMessage, error) {
@@ -238,6 +290,12 @@ type qqBotServer struct {
 	nginxServerConfs map[string]string // name -> conf filename
 	nginxACL         map[string][]string
 
+	// Steam 监控与已连接 OneBot 客户端
+	steamMu    sync.RWMutex
+	steamWatch map[string]*steamWatchEntry
+	clientsMu  sync.RWMutex
+	clients    map[*wsClient]struct{}
+
 	// HTTP 客户端
 	httpClient  *http.Client
 	proxyClient *http.Client
@@ -281,20 +339,127 @@ func envBoolOrDefault(key string, def bool) bool {
 	}
 }
 
+func envIntOrDefault(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envDurationOrDefault(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
+func parseCSVEnv(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func stripJSONComments(input []byte) []byte {
+	out := make([]byte, 0, len(input))
+	inString := false
+	escaped := false
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		if inString {
+			out = append(out, ch)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			out = append(out, ch)
+			continue
+		}
+		if ch == '/' && i+1 < len(input) {
+			next := input[i+1]
+			if next == '/' {
+				i += 2
+				for i < len(input) && input[i] != '\n' && input[i] != '\r' {
+					i++
+				}
+				if i < len(input) {
+					out = append(out, input[i])
+				}
+				continue
+			}
+			if next == '*' {
+				i += 2
+				for i+1 < len(input) && !(input[i] == '*' && input[i+1] == '/') {
+					i++
+				}
+				i++
+				continue
+			}
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
 // fileConfig 对应 configs/config.json，用来从文件加载 API Key 等敏感配置。
 type fileConfig struct {
-	ClaudeAPIKey    string `json:"claude_api_key"`
-	ClaudeAPIBase   string `json:"claude_api_base"`
-	ClaudeModel     string `json:"claude_model"`
-	GPTAPIKey       string `json:"gpt_api_key"`
-	GPTAPIBase      string `json:"gpt_api_base"`
-	GPTModel        string `json:"gpt_model"`
-	GrokAPIKey      string `json:"grok_api_key"`
-	GrokAPIBase     string `json:"grok_api_base"`
-	GrokModel       string `json:"grok_model"`
-	AMapAPIKey      string `json:"amap_api_key"`
-	BilibiliAPIBase string `json:"bilibili_api_base"`
-	Socks5Proxy     string `json:"socks5_proxy"`
+	ClaudeAPIKey         string   `json:"claude_api_key"`
+	ClaudeAPIBase        string   `json:"claude_api_base"`
+	ClaudeModel          string   `json:"claude_model"`
+	GPTAPIKey            string   `json:"gpt_api_key"`
+	GPTAPIBase           string   `json:"gpt_api_base"`
+	GPTModel             string   `json:"gpt_model"`
+	GrokAPIKey           string   `json:"grok_api_key"`
+	GrokAPIBase          string   `json:"grok_api_base"`
+	GrokModel            string   `json:"grok_model"`
+	GeminiAPIKey         string   `json:"gemini_api_key"`
+	GeminiAPIBase        string   `json:"gemini_api_base"`
+	GeminiImageModel     string   `json:"gemini_image_model"`
+	DeepSeekAPIKey       string   `json:"deepseek_api_key"`
+	DeepSeekAPIBase      string   `json:"deepseek_api_base"`
+	DeepSeekModel        string   `json:"deepseek_model"`
+	SteamAPIKey          string   `json:"steam_api_key"`
+	SteamAPIBase         string   `json:"steam_api_base"`
+	SteamAPIKeyDomain    string   `json:"steam_api_key_domain"`
+	SteamMonitorGroups   []string `json:"steam_monitor_groups"`
+	SteamPollInterval    string   `json:"steam_poll_interval"`
+	LongForwardThreshold int      `json:"long_forward_threshold"`
+	MaxContextChars      int      `json:"max_context_chars"`
+	AMapAPIKey           string   `json:"amap_api_key"`
+	BilibiliAPIBase      string   `json:"bilibili_api_base"`
+	Socks5Proxy          string   `json:"socks5_proxy"`
 }
 
 // loadConfigFromFile 从 JSON 配置文件加载配置，并覆盖默认的环境变量值。
@@ -308,7 +473,7 @@ func loadConfigFromFile(path string) {
 		return
 	}
 	var cfg fileConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(stripJSONComments(data), &cfg); err != nil {
 		log.Printf("解析配置文件失败: %v", err)
 		return
 	}
@@ -340,6 +505,49 @@ func loadConfigFromFile(path string) {
 	}
 	if cfg.GrokModel != "" {
 		grokModel = cfg.GrokModel
+	}
+	if cfg.GeminiAPIKey != "" {
+		geminiAPIKey = cfg.GeminiAPIKey
+	}
+	if cfg.GeminiAPIBase != "" {
+		geminiAPIBase = cfg.GeminiAPIBase
+	}
+	if cfg.GeminiImageModel != "" {
+		geminiImageModel = cfg.GeminiImageModel
+	}
+	if cfg.DeepSeekAPIKey != "" {
+		deepSeekAPIKey = cfg.DeepSeekAPIKey
+	}
+	if cfg.DeepSeekAPIBase != "" {
+		deepSeekAPIBase = cfg.DeepSeekAPIBase
+	}
+	if cfg.DeepSeekModel != "" {
+		deepSeekModel = cfg.DeepSeekModel
+	}
+	if cfg.SteamAPIKey != "" {
+		steamAPIKey = cfg.SteamAPIKey
+	}
+	if cfg.SteamAPIBase != "" {
+		steamAPIBase = cfg.SteamAPIBase
+	}
+	if cfg.SteamAPIKeyDomain != "" {
+		steamAPIKeyDomain = cfg.SteamAPIKeyDomain
+	}
+	if len(cfg.SteamMonitorGroups) > 0 {
+		steamMonitorGroups = cfg.SteamMonitorGroups
+	}
+	if cfg.SteamPollInterval != "" {
+		if d, err := time.ParseDuration(cfg.SteamPollInterval); err == nil && d > 0 {
+			steamPollInterval = d
+		} else if n, err := strconv.Atoi(cfg.SteamPollInterval); err == nil && n > 0 {
+			steamPollInterval = time.Duration(n) * time.Second
+		}
+	}
+	if cfg.LongForwardThreshold > 0 {
+		longForwardThreshold = cfg.LongForwardThreshold
+	}
+	if cfg.MaxContextChars > 0 {
+		maxContextChars = cfg.MaxContextChars
 	}
 	if cfg.AMapAPIKey != "" {
 		amapAPIKey = cfg.AMapAPIKey
@@ -448,6 +656,8 @@ func newQQBotServer() *qqBotServer {
 		nginxServers:     make(map[string]string),
 		nginxServerConfs: make(map[string]string),
 		nginxACL:         make(map[string][]string),
+		steamWatch:       make(map[string]*steamWatchEntry),
+		clients:          make(map[*wsClient]struct{}),
 		httpClient:       newHTTPClient(),
 		proxyClient:      newProxyHTTPClient(),
 		reCQ:             reCQ,
@@ -465,7 +675,9 @@ func newQQBotServer() *qqBotServer {
 	bot.loadMemory()
 	bot.loadModelPrompts()
 	bot.loadNginxServers()
+	bot.loadSteamWatch()
 	bot.startBackgroundSave()
+	bot.startSteamMonitor()
 
 	return bot
 }
@@ -601,6 +813,53 @@ func (b *qqBotServer) appendHistory(qq, role, content string) {
 	b.memoryDirty = true
 }
 
+func (b *qqBotServer) appendUserEvent(qq, groupID, typ, detail string) {
+	if qq == "" || qq == "0" || strings.TrimSpace(detail) == "" {
+		return
+	}
+	b.memoryMu.Lock()
+	defer b.memoryMu.Unlock()
+	up := b.ensureUser(qq)
+	up.Events = append(up.Events, userEvent{
+		Time:    time.Now().Format(time.RFC3339),
+		Type:    typ,
+		GroupID: groupID,
+		Detail:  detail,
+	})
+	if len(up.Events) > 80 {
+		up.Events = up.Events[len(up.Events)-80:]
+	}
+	b.memoryDirty = true
+}
+
+func (b *qqBotServer) rememberBotAction(qq, groupID, command, result string) {
+	command = strings.TrimSpace(command)
+	result = strings.TrimSpace(result)
+	if command == "" {
+		return
+	}
+	if len(result) > 500 {
+		result = result[:500] + "...(已截断)"
+	}
+	b.appendUserEvent(qq, groupID, "bot_command", fmt.Sprintf("执行命令: %s；结果: %s", command, result))
+}
+
+func (b *qqBotServer) recentUserEvents(qq string, limit int) []userEvent {
+	b.memoryMu.RLock()
+	defer b.memoryMu.RUnlock()
+	up, ok := b.users[qq]
+	if !ok || len(up.Events) == 0 {
+		return nil
+	}
+	start := len(up.Events) - limit
+	if start < 0 {
+		start = 0
+	}
+	out := make([]userEvent, 0, len(up.Events)-start)
+	out = append(out, up.Events[start:]...)
+	return out
+}
+
 func (b *qqBotServer) clearUserMemory(qq string) bool {
 	b.memoryMu.Lock()
 	defer b.memoryMu.Unlock()
@@ -629,7 +888,7 @@ func (b *qqBotServer) getUserModel(qq string, groupID *string) string {
 }
 
 func (b *qqBotServer) setUserModel(qq, model string) bool {
-	if model != "claude" && model != "gpt" && model != "grok" {
+	if model != "claude" && model != "gpt" && model != "grok" && model != "deepseek" {
 		return false
 	}
 	b.memoryMu.Lock()
@@ -641,7 +900,7 @@ func (b *qqBotServer) setUserModel(qq, model string) bool {
 }
 
 func (b *qqBotServer) setGroupDefaultModel(groupID, model string) bool {
-	if model != "gpt" && model != "claude" && model != "grok" {
+	if model != "gpt" && model != "claude" && model != "grok" && model != "deepseek" {
 		return false
 	}
 	b.memoryMu.Lock()
@@ -684,9 +943,10 @@ func (b *qqBotServer) setGroupBVEnabled(groupID string, enabled bool) {
 
 func (b *qqBotServer) loadModelPrompts() {
 	defaults := map[string]string{
-		"grok":   "你是Grok，语气轻松幽默。",
-		"gpt":    "你是AI助手，请简洁回答。",
-		"claude": "你是Claude，请详细且逻辑清晰地回答。",
+		"grok":     "你是Grok，语气轻松幽默。",
+		"gpt":      "你是AI助手，请简洁回答。",
+		"claude":   "你是Claude，请详细且逻辑清晰地回答。",
+		"deepseek": "你是DeepSeek，请用中文给出严谨、直接、可执行的回答。",
 	}
 	for model, filename := range promptFiles {
 		content, err := os.ReadFile(filename)
@@ -1778,7 +2038,7 @@ func (b *qqBotServer) resolveBilibiliBVFromURL(rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	setCrawlerHeaders(req, "https://www.bilibili.com/")
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
@@ -1816,12 +2076,13 @@ func (b *qqBotServer) parseBilibiliBV(bvid string) (string, string) {
 	q := req.URL.Query()
 	q.Set("bvid", bvid)
 	req.URL.RawQuery = q.Encode()
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	setCrawlerHeaders(req, "https://www.bilibili.com/video/"+bvid)
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Sprintf("❌ 解析错误: %v", err)
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
 	var raw struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -1838,16 +2099,84 @@ func (b *qqBotServer) parseBilibiliBV(bvid string) (string, string) {
 			} `json:"stat"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := json.Unmarshal(body, &raw); err != nil {
+		if pic, text := b.parseBilibiliBVFromHTML(bvid); text != "" {
+			return pic, text
+		}
 		return "", fmt.Sprintf("❌ 解析错误: %v", err)
 	}
 	if raw.Code != 0 {
+		if pic, text := b.parseBilibiliBVFromHTML(bvid); text != "" {
+			return pic, text
+		}
 		return "", fmt.Sprintf("❌ 视频失效: %s", raw.Message)
 	}
 	info := raw.Data
 	res := fmt.Sprintf("📺 %s\n👤 UP: %s\n📊 播放: %d  👍 %d  💰 %d\n🔗 https://www.bilibili.com/video/%s",
 		info.Title, info.Owner.Name, info.Stat.View, info.Stat.Like, info.Stat.Coin, bvid)
 	return info.Pic, res
+}
+
+func setCrawlerHeaders(req *http.Request, referer string) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.7")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+}
+
+func (b *qqBotServer) parseBilibiliBVFromHTML(bvid string) (string, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pageURL := "https://www.bilibili.com/video/" + bvid
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	setCrawlerHeaders(req, "https://www.bilibili.com/")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", ""
+	}
+	html := string(body)
+	title := ""
+	if m := regexp.MustCompile(`(?is)<meta\s+property="og:title"\s+content="([^"]+)"`).FindStringSubmatch(html); len(m) >= 2 {
+		title = htmlUnescapeLite(m[1])
+	}
+	if title == "" {
+		if m := regexp.MustCompile(`(?is)<title>([^<]+)</title>`).FindStringSubmatch(html); len(m) >= 2 {
+			title = htmlUnescapeLite(strings.Replace(m[1], "_哔哩哔哩_bilibili", "", 1))
+		}
+	}
+	pic := ""
+	if m := regexp.MustCompile(`(?is)<meta\s+property="og:image"\s+content="([^"]+)"`).FindStringSubmatch(html); len(m) >= 2 {
+		pic = strings.TrimSpace(htmlUnescapeLite(m[1]))
+		if strings.HasPrefix(pic, "//") {
+			pic = "https:" + pic
+		}
+	}
+	up := ""
+	if m := regexp.MustCompile(`(?is)"name"\s*:\s*"([^"]+)"\s*,\s*"face"`).FindStringSubmatch(html); len(m) >= 2 {
+		up = htmlUnescapeLite(m[1])
+	}
+	if title == "" {
+		return "", ""
+	}
+	if up == "" {
+		up = "未知"
+	}
+	res := fmt.Sprintf("📺 %s\n👤 UP: %s\n🔗 %s", title, up, pageURL)
+	return pic, res
+}
+
+func htmlUnescapeLite(s string) string {
+	repl := strings.NewReplacer("&amp;", "&", "&quot;", "\"", "&#34;", "\"", "&#39;", "'", "&lt;", "<", "&gt;", ">")
+	return repl.Replace(s)
 }
 
 func (b *qqBotServer) fetchImageBase64(url string, useProxy bool) (string, error) {
@@ -1909,6 +2238,604 @@ func (b *qqBotServer) parseYouTubeVideo(videoID string) (string, string) {
 	}
 	res := fmt.Sprintf("🎬 YouTube 视频\n📺 标题: %s\n🔗 链接: %s", title, url)
 	return b64, res
+}
+
+// ============ Steam / Web 工具 ============
+
+type steamPlayerSummary struct {
+	SteamID       string `json:"steamid"`
+	PersonaName   string `json:"personaname"`
+	PersonaState  int    `json:"personastate"`
+	GameExtraInfo string `json:"gameextrainfo"`
+	GameID        string `json:"gameid"`
+}
+
+func (b *qqBotServer) loadSteamWatch() {
+	b.steamMu.Lock()
+	defer b.steamMu.Unlock()
+	data, err := os.ReadFile(steamWatchFile)
+	if err != nil {
+		return
+	}
+	var s steamWatchState
+	if err := json.Unmarshal(data, &s); err != nil {
+		b.logger.Printf("加载 Steam 监控失败: %v", err)
+		return
+	}
+	if s.Watched == nil {
+		s.Watched = make(map[string]*steamWatchEntry)
+	}
+	b.steamWatch = s.Watched
+}
+
+func (b *qqBotServer) saveSteamWatchLocked() {
+	data, err := json.MarshalIndent(steamWatchState{Watched: b.steamWatch}, "", "  ")
+	if err != nil {
+		b.logger.Printf("保存 Steam 监控失败: %v", err)
+		return
+	}
+	tmp := steamWatchFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		b.logger.Printf("保存 Steam 监控失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, steamWatchFile); err != nil {
+		b.logger.Printf("保存 Steam 监控失败: %v", err)
+	}
+}
+
+func normalizeSteamID64(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, "<>")
+	if m := regexp.MustCompile(`steamcommunity\.com/profiles/(\d{15,20})`).FindStringSubmatch(raw); len(m) >= 2 {
+		raw = m[1]
+	}
+	if m := regexp.MustCompile(`\[U:1:(\d+)\]`).FindStringSubmatch(raw); len(m) >= 2 {
+		accountID, _ := strconv.ParseInt(m[1], 10, 64)
+		return strconv.FormatInt(76561197960265728+accountID, 10), true
+	}
+	if regexp.MustCompile(`^\d{15,20}$`).MatchString(raw) {
+		return raw, true
+	}
+	if regexp.MustCompile(`^\d{1,12}$`).MatchString(raw) {
+		accountID, _ := strconv.ParseInt(raw, 10, 64)
+		return strconv.FormatInt(76561197960265728+accountID, 10), true
+	}
+	return "", false
+}
+
+func extractSteamVanity(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if m := regexp.MustCompile(`steamcommunity\.com/id/([^/?#\s]+)`).FindStringSubmatch(raw); len(m) >= 2 {
+		return m[1]
+	}
+	if strings.Contains(raw, "/") || strings.Contains(raw, " ") {
+		return ""
+	}
+	if _, ok := normalizeSteamID64(raw); ok {
+		return ""
+	}
+	return raw
+}
+
+func (b *qqBotServer) resolveSteamTarget(raw string) (string, error) {
+	if id, ok := normalizeSteamID64(raw); ok {
+		return id, nil
+	}
+	vanity := extractSteamVanity(raw)
+	if vanity == "" {
+		return "", errors.New("无法识别 SteamID64 / 数字好友代码 / Steam 个人资料链接")
+	}
+	if steamAPIKey == "" {
+		return "", errors.New("Steam 未配置 API Key")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	u := strings.TrimRight(steamAPIBase, "/") + "/ISteamUser/ResolveVanityURL/v1/"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	q := req.URL.Query()
+	q.Set("key", steamAPIKey)
+	q.Set("vanityurl", vanity)
+	req.URL.RawQuery = q.Encode()
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var rawResp struct {
+		Response struct {
+			Success int    `json:"success"`
+			SteamID string `json:"steamid"`
+			Message string `json:"message"`
+		} `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rawResp); err != nil {
+		return "", err
+	}
+	if rawResp.Response.Success != 1 || rawResp.Response.SteamID == "" {
+		if rawResp.Response.Message != "" {
+			return "", errors.New(rawResp.Response.Message)
+		}
+		return "", errors.New("Steam 自定义链接解析失败")
+	}
+	return rawResp.Response.SteamID, nil
+}
+
+func (b *qqBotServer) fetchSteamSummaries(ids []string) (map[string]steamPlayerSummary, error) {
+	if steamAPIKey == "" {
+		return nil, errors.New("Steam 未配置 API Key")
+	}
+	if len(ids) == 0 {
+		return map[string]steamPlayerSummary{}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	u := strings.TrimRight(steamAPIBase, "/") + "/ISteamUser/GetPlayerSummaries/v0002/"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	q := req.URL.Query()
+	q.Set("key", steamAPIKey)
+	q.Set("steamids", strings.Join(ids, ","))
+	req.URL.RawQuery = q.Encode()
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var raw struct {
+		Response struct {
+			Players []steamPlayerSummary `json:"players"`
+		} `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	out := make(map[string]steamPlayerSummary, len(raw.Response.Players))
+	for _, p := range raw.Response.Players {
+		out[p.SteamID] = p
+	}
+	return out, nil
+}
+
+func (b *qqBotServer) getSteamFriendsStatus(raw string) string {
+	id, err := b.resolveSteamTarget(raw)
+	if err != nil {
+		return "❌ Steam 好友解析失败: " + err.Error()
+	}
+	if steamAPIKey == "" {
+		return "❌ Steam 未配置 API Key"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	u := strings.TrimRight(steamAPIBase, "/") + "/ISteamUser/GetFriendList/v1/"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	q := req.URL.Query()
+	q.Set("key", steamAPIKey)
+	q.Set("steamid", id)
+	q.Set("relationship", "friend")
+	req.URL.RawQuery = q.Encode()
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "❌ Steam 好友查询失败: " + err.Error()
+	}
+	defer resp.Body.Close()
+	var rawResp struct {
+		FriendsList struct {
+			Friends []struct {
+				SteamID string `json:"steamid"`
+			} `json:"friends"`
+		} `json:"friendslist"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rawResp); err != nil {
+		return "❌ Steam 好友查询失败: " + err.Error()
+	}
+	if len(rawResp.FriendsList.Friends) == 0 {
+		return "ℹ️ 没有拿到好友列表，可能该账号好友列表未公开"
+	}
+	ids := make([]string, 0, len(rawResp.FriendsList.Friends))
+	for i, f := range rawResp.FriendsList.Friends {
+		if i >= 100 {
+			break
+		}
+		ids = append(ids, f.SteamID)
+	}
+	summaries, err := b.fetchSteamSummaries(ids)
+	if err != nil {
+		return "❌ Steam 好友状态查询失败: " + err.Error()
+	}
+	lines := []string{"👥 Steam 好友在线/游戏状态:"}
+	count := 0
+	for _, sid := range ids {
+		p := summaries[sid]
+		if p.PersonaState == 0 && p.GameExtraInfo == "" {
+			continue
+		}
+		count++
+		status := steamStateName(p.PersonaState)
+		if p.GameExtraInfo != "" {
+			status += "，正在玩 " + p.GameExtraInfo
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s (%s)", count, p.PersonaName, status))
+		if count >= 30 {
+			break
+		}
+	}
+	if count == 0 {
+		return "ℹ️ 好友列表里当前没有在线或正在游戏的用户"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func steamStateName(state int) string {
+	switch state {
+	case 0:
+		return "离线"
+	case 1:
+		return "在线"
+	case 2:
+		return "忙碌"
+	case 3:
+		return "离开"
+	case 4:
+		return "打盹"
+	case 5:
+		return "想交易"
+	case 6:
+		return "想玩游戏"
+	default:
+		return fmt.Sprintf("未知(%d)", state)
+	}
+}
+
+func (b *qqBotServer) handleSteamWatchCommand(raw string) string {
+	id, err := b.resolveSteamTarget(raw)
+	if err != nil {
+		return "❌ 添加监控失败: " + err.Error()
+	}
+	summaries, err := b.fetchSteamSummaries([]string{id})
+	if err != nil {
+		return "❌ 查询 Steam 失败: " + err.Error()
+	}
+	p := summaries[id]
+	name := p.PersonaName
+	if name == "" {
+		name = id
+	}
+	b.steamMu.Lock()
+	defer b.steamMu.Unlock()
+	entry := b.steamWatch[id]
+	if entry == nil {
+		entry = &steamWatchEntry{SteamID: id}
+		b.steamWatch[id] = entry
+	}
+	entry.Name = name
+	entry.LastState = p.PersonaState
+	entry.LastGameID = p.GameID
+	entry.LastGameName = p.GameExtraInfo
+	if p.GameExtraInfo != "" && entry.GameStarted == "" {
+		entry.GameStarted = time.Now().Format(time.RFC3339)
+	}
+	entry.UpdatedAt = time.Now().Format(time.RFC3339)
+	b.saveSteamWatchLocked()
+	extra := ""
+	if p.GameExtraInfo != "" {
+		extra = "\n当前游戏: " + p.GameExtraInfo
+	}
+	return fmt.Sprintf("✅ 已加入 Steam 监控: %s (%s)\n状态: %s%s", name, id, steamStateName(p.PersonaState), extra)
+}
+
+func (b *qqBotServer) handleSteamWatchRemoveCommand(raw string) string {
+	raw = strings.TrimSpace(raw)
+	b.steamMu.Lock()
+	defer b.steamMu.Unlock()
+	targetID := ""
+	if id, ok := normalizeSteamID64(raw); ok {
+		targetID = id
+	} else {
+		for id, entry := range b.steamWatch {
+			if strings.EqualFold(entry.Name, raw) || strings.Contains(strings.ToLower(entry.Name), strings.ToLower(raw)) {
+				targetID = id
+				break
+			}
+		}
+	}
+	if targetID == "" {
+		return "❌ 未找到要删除的 Steam 监控对象"
+	}
+	name := b.steamWatch[targetID].Name
+	delete(b.steamWatch, targetID)
+	b.saveSteamWatchLocked()
+	return fmt.Sprintf("✅ 已删除 Steam 监控: %s (%s)", name, targetID)
+}
+
+func (b *qqBotServer) handleSteamWatchListCommand() string {
+	b.steamMu.RLock()
+	defer b.steamMu.RUnlock()
+	if len(b.steamWatch) == 0 {
+		return "📭 当前没有 Steam 监控对象"
+	}
+	lines := []string{"🎮 Steam 监控列表:"}
+	for _, e := range b.steamWatch {
+		status := steamStateName(e.LastState)
+		if e.LastGameName != "" {
+			status += "，正在玩 " + e.LastGameName
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%s): %s", e.Name, e.SteamID, status))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *qqBotServer) startSteamMonitor() {
+	if steamPollInterval <= 0 {
+		return
+	}
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		ticker := time.NewTicker(steamPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				b.pollSteamWatch()
+			case <-b.shutdown:
+				return
+			}
+		}
+	}()
+}
+
+func (b *qqBotServer) pollSteamWatch() {
+	if steamAPIKey == "" || len(steamMonitorGroups) == 0 {
+		return
+	}
+	b.steamMu.RLock()
+	ids := make([]string, 0, len(b.steamWatch))
+	for id := range b.steamWatch {
+		ids = append(ids, id)
+	}
+	b.steamMu.RUnlock()
+	if len(ids) == 0 {
+		return
+	}
+	summaries, err := b.fetchSteamSummaries(ids)
+	if err != nil {
+		b.logger.Printf("Steam 监控轮询失败: %v", err)
+		return
+	}
+	now := time.Now()
+	var notices []string
+	b.steamMu.Lock()
+	for _, id := range ids {
+		entry := b.steamWatch[id]
+		if entry == nil {
+			continue
+		}
+		p, ok := summaries[id]
+		if !ok {
+			continue
+		}
+		oldGame := entry.LastGameName
+		oldState := entry.LastState
+		if p.PersonaName != "" {
+			entry.Name = p.PersonaName
+		}
+		if p.GameExtraInfo != oldGame {
+			if oldGame == "" && p.GameExtraInfo != "" {
+				entry.GameStarted = now.Format(time.RFC3339)
+				notices = append(notices, fmt.Sprintf("🎮 Steam 监控\n%s 开始游玩: %s", entry.Name, p.GameExtraInfo))
+			} else if oldGame != "" && p.GameExtraInfo == "" {
+				started, _ := time.Parse(time.RFC3339, entry.GameStarted)
+				duration := ""
+				if !started.IsZero() {
+					duration = fmt.Sprintf("\n本次游玩时长: %s", formatDurationCN(now.Sub(started)))
+				}
+				notices = append(notices, fmt.Sprintf("🛑 Steam 监控\n%s 已停止游玩: %s%s", entry.Name, oldGame, duration))
+				entry.GameStarted = ""
+			} else if oldGame != "" && p.GameExtraInfo != "" {
+				entry.GameStarted = now.Format(time.RFC3339)
+				notices = append(notices, fmt.Sprintf("🔄 Steam 监控\n%s 从 %s 切换到: %s", entry.Name, oldGame, p.GameExtraInfo))
+			}
+		}
+		if oldState != p.PersonaState && p.GameExtraInfo == "" {
+			notices = append(notices, fmt.Sprintf("👤 Steam 监控\n%s 状态变更: %s -> %s", entry.Name, steamStateName(oldState), steamStateName(p.PersonaState)))
+		}
+		entry.LastState = p.PersonaState
+		entry.LastGameID = p.GameID
+		entry.LastGameName = p.GameExtraInfo
+		entry.UpdatedAt = now.Format(time.RFC3339)
+	}
+	if len(notices) > 0 {
+		b.saveSteamWatchLocked()
+	}
+	b.steamMu.Unlock()
+	for _, notice := range notices {
+		b.broadcastToSteamGroups(notice)
+	}
+}
+
+func formatDurationCN(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%d小时%d分钟", h, m)
+	}
+	return fmt.Sprintf("%d分钟", m)
+}
+
+func (b *qqBotServer) broadcastToSteamGroups(text string) {
+	b.clientsMu.RLock()
+	clients := make([]*wsClient, 0, len(b.clients))
+	for c := range b.clients {
+		clients = append(clients, c)
+	}
+	b.clientsMu.RUnlock()
+	for _, gid := range steamMonitorGroups {
+		groupID, err := strconv.ParseInt(strings.TrimSpace(gid), 10, 64)
+		if err != nil || groupID <= 0 {
+			continue
+		}
+		for _, c := range clients {
+			b.sendLongText(c, "group", groupID, text, 0)
+		}
+	}
+}
+
+func (b *qqBotServer) getSteamDiscounts(query string) string {
+	query = strings.TrimSpace(query)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if query != "" {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://store.steampowered.com/api/storesearch/", nil)
+		q := req.URL.Query()
+		q.Set("term", query)
+		q.Set("cc", "cn")
+		q.Set("l", "schinese")
+		req.URL.RawQuery = q.Encode()
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36")
+		resp, err := b.httpClient.Do(req)
+		if err != nil {
+			return "❌ Steam 折扣查询失败: " + err.Error()
+		}
+		defer resp.Body.Close()
+		var raw struct {
+			Items []struct {
+				Name      string `json:"name"`
+				ID        int    `json:"id"`
+				TinyImage string `json:"tiny_image"`
+				Price     struct {
+					Final           int `json:"final"`
+					Initial         int `json:"initial"`
+					DiscountPercent int `json:"discount_percent"`
+				} `json:"price"`
+			} `json:"items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			return "❌ Steam 折扣查询失败: " + err.Error()
+		}
+		lines := []string{"🛒 Steam 折扣查询: " + query}
+		count := 0
+		for _, item := range raw.Items {
+			if item.Price.DiscountPercent <= 0 {
+				continue
+			}
+			count++
+			lines = append(lines, fmt.Sprintf("%d. %s -%d%% ￥%.2f -> ￥%.2f\nhttps://store.steampowered.com/app/%d", count, item.Name, item.Price.DiscountPercent, float64(item.Price.Initial)/100, float64(item.Price.Final)/100, item.ID))
+			if count >= 8 {
+				break
+			}
+		}
+		if count == 0 {
+			return "ℹ️ 没找到正在打折的相关物品"
+		}
+		return strings.Join(lines, "\n")
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://store.steampowered.com/api/featuredcategories/", nil)
+	q := req.URL.Query()
+	q.Set("cc", "cn")
+	q.Set("l", "schinese")
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "❌ Steam 折扣查询失败: " + err.Error()
+	}
+	defer resp.Body.Close()
+	var raw struct {
+		Specials struct {
+			Items []struct {
+				Name            string `json:"name"`
+				ID              int    `json:"id"`
+				FinalPrice      int    `json:"final_price"`
+				OriginalPrice   int    `json:"original_price"`
+				DiscountPercent int    `json:"discount_percent"`
+			} `json:"items"`
+		} `json:"specials"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return "❌ Steam 折扣查询失败: " + err.Error()
+	}
+	lines := []string{"🛒 Steam 当前热门折扣:"}
+	for i, item := range raw.Specials.Items {
+		if i >= 10 {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s -%d%% ￥%.2f -> ￥%.2f\nhttps://store.steampowered.com/app/%d", i+1, item.Name, item.DiscountPercent, float64(item.OriginalPrice)/100, float64(item.FinalPrice)/100, item.ID))
+	}
+	if len(lines) == 1 {
+		return "ℹ️ 当前没有拿到 Steam 热门折扣"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
+	rawURL = strings.TrimSpace(rawURL)
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", "❌ 用法: //web https://example.com"
+	}
+	bin := findChromeBinary()
+	if bin == "" {
+		return "", "❌ 截图失败: 未找到 Chrome/Chromium，可安装 Google Chrome 或设置 CHROME_BIN"
+	}
+	tmp, err := os.CreateTemp("", "yaqqbot-web-*.png")
+	if err != nil {
+		return "", "❌ 截图失败: " + err.Error()
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer os.Remove(tmpPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	args := []string{
+		"--headless=new",
+		"--disable-gpu",
+		"--no-sandbox",
+		"--hide-scrollbars",
+		"--window-size=1365,900",
+		"--screenshot=" + tmpPath,
+		rawURL,
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Sprintf("❌ 截图失败: %v %s", err, strings.TrimSpace(string(out)))
+	}
+	pngData, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return "", "❌ 截图失败: " + err.Error()
+	}
+	return "base64://" + base64.StdEncoding.EncodeToString(pngData), "🌐 页面截图: " + rawURL
+}
+
+func findChromeBinary() string {
+	if v := strings.TrimSpace(os.Getenv("CHROME_BIN")); v != "" {
+		return v
+	}
+	candidates := []string{
+		"google-chrome",
+		"chromium",
+		"chromium-browser",
+		"microsoft-edge",
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+	}
+	for _, c := range candidates {
+		if filepath.IsAbs(c) {
+			if st, err := os.Stat(c); err == nil && !st.IsDir() {
+				return c
+			}
+			continue
+		}
+		if p, err := exec.LookPath(c); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // ============ AI 调用 ============
@@ -2119,6 +3046,46 @@ func (b *qqBotServer) callGrokAPI(messages []chatMessage) string {
 	return raw.Choices[0].Message.Content
 }
 
+func (b *qqBotServer) callDeepSeekAPI(messages []chatMessage) string {
+	if deepSeekAPIKey == "" {
+		return "❌ DeepSeek 未配置 API Key"
+	}
+	url := strings.TrimRight(deepSeekAPIBase, "/") + "/chat/completions"
+	reqBody := map[string]any{
+		"model":       deepSeekModel,
+		"messages":    messages,
+		"temperature": 0.7,
+		"max_tokens":  4000,
+	}
+	data, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	req.Header.Set("Authorization", "Bearer "+deepSeekAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return fmt.Sprintf("❌ DeepSeek 调用失败: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("DeepSeek API Error: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var raw struct {
+		Choices []struct {
+			Message chatMessage `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Sprintf("❌ DeepSeek 解析失败: %v", err)
+	}
+	if len(raw.Choices) == 0 {
+		return "❌ DeepSeek 返回为空"
+	}
+	return raw.Choices[0].Message.Content
+}
+
 // 简单 Claude API 调用（兼容官方 /v1/messages 风格）
 func (b *qqBotServer) callClaudeAPI(systemPrompt string, messages []chatMessage) string {
 	if claudeAPIKey == "" {
@@ -2177,6 +3144,168 @@ func (b *qqBotServer) callClaudeAPI(systemPrompt string, messages []chatMessage)
 		return "Error: empty response"
 	}
 	return raw.Content[0].Text
+}
+
+func (b *qqBotServer) callGeminiImage(prompt string, width, height int) (imgBase64 string, text string, err error) {
+	if strings.TrimSpace(geminiAPIKey) == "" {
+		return "", "", errors.New("Gemini 未配置 API Key（GEMINI_API_KEY）")
+	}
+	apiBase := strings.TrimRight(strings.TrimSpace(geminiAPIBase), "/")
+	if apiBase == "" {
+		apiBase = "https://generativelanguage.googleapis.com/v1beta"
+	}
+	model := strings.TrimSpace(geminiImageModel)
+	if model == "" {
+		model = "gemini-2.5-flash-image"
+	}
+	if width > 0 && height > 0 {
+		prompt = fmt.Sprintf("%s\n\n请生成一张 %dx%d 像素、宽高比 %.4f:1 的图片。", prompt, width, height, float64(width)/float64(height))
+	}
+
+	url := fmt.Sprintf("%s/models/%s:generateContent", apiBase, model)
+	reqBody := map[string]any{
+		"contents": []map[string]any{
+			{
+				"parts": []map[string]any{
+					{"text": prompt},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("x-goog-api-key", geminiAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := b.proxyClient
+	if client == nil {
+		client = b.httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("Gemini API Error: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// 兼容 inlineData / inline_data 两种字段命名
+	type inlineData struct {
+		MimeType string `json:"mimeType"`
+		Data     string `json:"data"`
+	}
+	type part struct {
+		Text        string      `json:"text"`
+		InlineData  *inlineData `json:"inlineData"`
+		InlineData2 *inlineData `json:"inline_data"`
+	}
+	var raw struct {
+		Candidates []struct {
+			Content struct {
+				Parts []part `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "", "", err
+	}
+	var texts []string
+	img := ""
+	imgMime := ""
+	for _, c := range raw.Candidates {
+		for _, p := range c.Content.Parts {
+			if t := strings.TrimSpace(p.Text); t != "" {
+				texts = append(texts, t)
+			}
+			id := p.InlineData
+			if id == nil {
+				id = p.InlineData2
+			}
+			if img == "" && id != nil && strings.TrimSpace(id.Data) != "" {
+				// CQ:image 支持 base64:// 形式
+				img = "base64://" + strings.TrimSpace(id.Data)
+				imgMime = strings.TrimSpace(id.MimeType)
+			}
+		}
+	}
+	if len(texts) > 0 {
+		text = strings.Join(texts, "\n")
+	}
+	if img == "" {
+		// 允许“只返回文字”的情况
+		if strings.TrimSpace(text) != "" {
+			return "", text, nil
+		}
+		return "", "", errors.New("Gemini 未返回图片/文字数据")
+	}
+	if width > 0 && height > 0 {
+		resized, err := resizeBase64ImageForCQ(img, imgMime, width, height)
+		if err != nil {
+			return "", "", fmt.Errorf("图片已生成，但调整尺寸失败: %w", err)
+		}
+		img = resized
+	}
+	return img, text, nil
+}
+
+func parseImageCommand(raw string) (prompt string, width int, height int, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", 0, 0, nil
+	}
+	re := regexp.MustCompile(`(?i)(?:^|\s)(?:--?size[=\s]+)?(\d{2,4})\s*[x×]\s*(\d{2,4})(?:\s|$)`)
+	m := re.FindStringSubmatchIndex(raw)
+	if len(m) >= 6 {
+		wStr := raw[m[2]:m[3]]
+		hStr := raw[m[4]:m[5]]
+		w, _ := strconv.Atoi(wStr)
+		h, _ := strconv.Atoi(hStr)
+		if w < 64 || h < 64 || w > 4096 || h > 4096 {
+			return "", 0, 0, fmt.Errorf("尺寸范围应为 64x64 到 4096x4096")
+		}
+		raw = strings.TrimSpace(raw[:m[0]] + " " + raw[m[1]:])
+		return raw, w, h, nil
+	}
+	return raw, 0, 0, nil
+}
+
+func resizeBase64ImageForCQ(cqFile, mimeType string, width, height int) (string, error) {
+	b64 := strings.TrimPrefix(strings.TrimSpace(cqFile), "base64://")
+	data, err := decodeBase64Any(b64)
+	if err != nil {
+		return "", err
+	}
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	sb := src.Bounds()
+	for y := 0; y < height; y++ {
+		sy := sb.Min.Y + y*sb.Dy()/height
+		for x := 0; x < width; x++ {
+			sx := sb.Min.X + x*sb.Dx()/width
+			dst.Set(x, y, src.At(sx, sy))
+		}
+	}
+	var buf bytes.Buffer
+	if strings.Contains(strings.ToLower(mimeType), "jpeg") || strings.Contains(strings.ToLower(mimeType), "jpg") {
+		if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 92}); err != nil {
+			return "", err
+		}
+	} else {
+		if err := png.Encode(&buf, dst); err != nil {
+			return "", err
+		}
+	}
+	return "base64://" + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 // ============ 消息处理 ============
@@ -2455,9 +3584,71 @@ func (b *qqBotServer) saveIncomingImagesFromOneBotMessage(message any) ([]string
 	}
 }
 
-func (b *qqBotServer) sendLongText(client *wsClient, messageType string, targetID int64, text string) {
+func splitTextBySize(text string, size int) []string {
+	if size <= 0 || len(text) <= size {
+		return []string{text}
+	}
+	var parts []string
+	for start := 0; start < len(text); start += size {
+		end := start + size
+		if end > len(text) {
+			end = len(text)
+		}
+		parts = append(parts, text[start:end])
+	}
+	return parts
+}
+
+func (b *qqBotServer) sendForwardMessage(client *wsClient, messageType string, targetID int64, text string, selfID int64) error {
+	if messageType != "group" && messageType != "private" {
+		return errors.New("unsupported message type")
+	}
+	if selfID == 0 {
+		selfID = 10000
+	}
+	nodes := make([]map[string]any, 0)
+	for i, part := range splitTextBySize(text, 1800) {
+		name := "YaqqBot"
+		if i > 0 {
+			name = fmt.Sprintf("YaqqBot %d", i+1)
+		}
+		nodes = append(nodes, map[string]any{
+			"type": "node",
+			"data": map[string]any{
+				"name":    name,
+				"uin":     strconv.FormatInt(selfID, 10),
+				"content": part,
+			},
+		})
+	}
+	action := "send_group_forward_msg"
+	params := map[string]any{
+		"group_id": targetID,
+		"messages": nodes,
+	}
+	if messageType == "private" {
+		action = "send_private_forward_msg"
+		params = map[string]any{
+			"user_id":  targetID,
+			"messages": nodes,
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := client.Call(ctx, action, params)
+	return err
+}
+
+func (b *qqBotServer) sendLongText(client *wsClient, messageType string, targetID int64, text string, selfID int64) {
 	if text == "" {
 		return
+	}
+	if longForwardThreshold > 0 && len(text) > longForwardThreshold {
+		if err := b.sendForwardMessage(client, messageType, targetID, text, selfID); err == nil {
+			return
+		} else {
+			b.logger.Printf("合并转发失败，回退分段发送: %v", err)
+		}
 	}
 	for start := 0; start < len(text); start += messageChunkSize {
 		end := start + messageChunkSize
@@ -2487,12 +3678,107 @@ func (b *qqBotServer) sendLongText(client *wsClient, messageType string, targetI
 	}
 }
 
+func (b *qqBotServer) registerClient(client *wsClient) {
+	b.clientsMu.Lock()
+	defer b.clientsMu.Unlock()
+	b.clients[client] = struct{}{}
+}
+
+func (b *qqBotServer) unregisterClient(client *wsClient) {
+	b.clientsMu.Lock()
+	defer b.clientsMu.Unlock()
+	delete(b.clients, client)
+}
+
+func (b *qqBotServer) handleBotEvent(payload []byte) {
+	var evt cqMessage
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		return
+	}
+	groupID := ""
+	if evt.GroupID != 0 {
+		groupID = strconv.FormatInt(evt.GroupID, 10)
+	}
+	switch evt.PostType {
+	case "notice":
+		userID := strconv.FormatInt(evt.UserID, 10)
+		targetID := strconv.FormatInt(evt.TargetID, 10)
+		operatorID := strconv.FormatInt(evt.OperatorID, 10)
+		var detail string
+		switch evt.NoticeType {
+		case "notify":
+			if evt.SubType == "poke" {
+				detail = fmt.Sprintf("在群 %s 戳了 %s", groupID, targetID)
+			} else {
+				detail = fmt.Sprintf("notify/%s target=%s operator=%s", evt.SubType, targetID, operatorID)
+			}
+		case "group_increase":
+			detail = fmt.Sprintf("加入群 %s，操作者 %s", groupID, operatorID)
+		case "group_decrease":
+			detail = fmt.Sprintf("离开群 %s，操作者 %s，类型 %s", groupID, operatorID, evt.SubType)
+		case "group_admin", "group_ban", "group_upload", "group_recall", "friend_recall", "friend_add":
+			detail = fmt.Sprintf("%s/%s group=%s target=%s operator=%s message=%d", evt.NoticeType, evt.SubType, groupID, targetID, operatorID, evt.MessageID)
+		default:
+			detail = fmt.Sprintf("%s/%s group=%s target=%s operator=%s", evt.NoticeType, evt.SubType, groupID, targetID, operatorID)
+		}
+		if userID != "" && userID != "0" {
+			b.appendUserEvent(userID, groupID, "qq_notice", detail)
+		}
+		if targetID != "" && targetID != "0" && targetID != userID {
+			b.appendUserEvent(targetID, groupID, "qq_notice", detail)
+		}
+	case "request":
+		userID := strconv.FormatInt(evt.UserID, 10)
+		detail := fmt.Sprintf("%s/%s group=%s comment=%s", evt.RequestType, evt.SubType, groupID, evt.Comment)
+		b.appendUserEvent(userID, groupID, "qq_request", detail)
+	}
+}
+
+func compactChatMessages(messages []chatMessage, maxChars int) []chatMessage {
+	if maxChars <= 0 {
+		return messages
+	}
+	total := 0
+	for _, m := range messages {
+		total += len(m.Content)
+	}
+	if total <= maxChars {
+		return messages
+	}
+	if len(messages) <= 4 {
+		return messages
+	}
+	system := messages[0]
+	tail := make([]chatMessage, 0)
+	tailChars := 0
+	for i := len(messages) - 1; i >= 1; i-- {
+		c := len(messages[i].Content)
+		if len(tail) >= 6 && tailChars+c > maxChars*2/3 {
+			break
+		}
+		tail = append(tail, messages[i])
+		tailChars += c
+	}
+	for i, j := 0, len(tail)-1; i < j; i, j = i+1, j-1 {
+		tail[i], tail[j] = tail[j], tail[i]
+	}
+	omitted := len(messages) - 1 - len(tail)
+	summary := chatMessage{
+		Role:    "system",
+		Content: fmt.Sprintf("较早的 %d 条历史已被折叠，以控制上下文长度。请优先依据最近消息和用户长期事件记忆回答。", omitted),
+	}
+	out := []chatMessage{system, summary}
+	out = append(out, tail...)
+	return out
+}
+
 func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 	var msg cqMessage
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		return
 	}
 	if msg.PostType != "message" {
+		b.handleBotEvent(payload)
 		return
 	}
 	msgType := msg.MessageType
@@ -2517,6 +3803,10 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 	}
 
 	cleanMsg := b.stripCQCodes(rawMsg)
+	commandMsg := cleanMsg
+	if strings.HasPrefix(commandMsg, "//") {
+		commandMsg = commandMsg[1:]
+	}
 	isAtMe := msgType == "group" && strings.Contains(rawMsg, "[CQ:at,qq="+selfID+"]")
 	hasImage := b.reCQImage.MatchString(rawMsg)
 	replyMsgID, hasReply := b.extractReplyMessageID(rawMsg)
@@ -2539,9 +3829,17 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 	// 指令处理
 	if responseText == "" {
 		switch {
-		case strings.HasPrefix(cleanMsg, "/help"):
+		case strings.HasPrefix(commandMsg, "/help"):
 			responseText = "🤖 帮助:\n" +
 				"/ct [问题]           - 问答\n" +
+				"/deepseek [问题]     - 使用 DeepSeek agent\n" +
+				"/img [尺寸] [提示词] - Gemini 生成图片，如 /img 1024x768 赛博城市\n" +
+				"//web [URL]          - 无头浏览器打开网页并截图\n" +
+				"//whatch [SteamID/好友代码/自定义名/链接] - 加入 Steam 监控\n" +
+				"//whatchrm [名字/SteamID] - 删除 Steam 监控\n" +
+				"//list               - 查看 Steam 监控列表\n" +
+				"//friends [SteamID/链接] - 查看公开好友在线/游戏状态\n" +
+				"//buy [关键词]       - 查询 Steam 折扣，不填显示热门折扣\n" +
 				"/ping [域名]         - 代理测速\n" +
 				"/nginx ...           - 管理 Nginx stream/远程转发\n" +
 				"  /nginx list        - 列出当前配置\n" +
@@ -2558,39 +3856,73 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				"/rs                  - B站热搜\n" +
 				"/epic                - Epic 喜加一\n" +
 				"/bv [BV号/on/off]"
-		case strings.HasPrefix(cleanMsg, "/ping "):
-			responseText = b.pingViaProxy(strings.TrimSpace(cleanMsg[6:]))
-		case strings.HasPrefix(cleanMsg, "/nginx"):
-			args := strings.TrimSpace(cleanMsg[len("/nginx"):])
+		case strings.HasPrefix(commandMsg, "/ping "):
+			responseText = b.pingViaProxy(strings.TrimSpace(commandMsg[6:]))
+		case strings.HasPrefix(commandMsg, "/img "):
+			p, w, h, err := parseImageCommand(strings.TrimSpace(commandMsg[5:]))
+			if err != nil {
+				responseText = "❌ " + err.Error()
+				break
+			}
+			if p == "" {
+				responseText = "❌ 用法: /img [可选尺寸如 1024x768] 你的提示词"
+				break
+			}
+			img, txt, err := b.callGeminiImage(p, w, h)
+			if err != nil {
+				responseText = "❌ Gemini 生成失败: " + err.Error()
+			} else {
+				responseImg = img
+				// 支持 Gemini 同时返回的文本说明；有的响应可能仅返回文字。
+				responseText = strings.TrimSpace(txt)
+			}
+		case strings.HasPrefix(commandMsg, "/web "):
+			responseImg, responseText = b.captureWebScreenshot(strings.TrimSpace(commandMsg[5:]))
+		case strings.HasPrefix(commandMsg, "/whatch "):
+			responseText = b.handleSteamWatchCommand(strings.TrimSpace(commandMsg[len("/whatch "):]))
+		case strings.HasPrefix(commandMsg, "/watch "):
+			responseText = b.handleSteamWatchCommand(strings.TrimSpace(commandMsg[len("/watch "):]))
+		case strings.HasPrefix(commandMsg, "/whatchrm "):
+			responseText = b.handleSteamWatchRemoveCommand(strings.TrimSpace(commandMsg[len("/whatchrm "):]))
+		case strings.HasPrefix(commandMsg, "/watchrm "):
+			responseText = b.handleSteamWatchRemoveCommand(strings.TrimSpace(commandMsg[len("/watchrm "):]))
+		case strings.TrimSpace(commandMsg) == "/list":
+			responseText = b.handleSteamWatchListCommand()
+		case strings.HasPrefix(commandMsg, "/friends "):
+			responseText = b.getSteamFriendsStatus(strings.TrimSpace(commandMsg[len("/friends "):]))
+		case strings.HasPrefix(commandMsg, "/buy"):
+			responseText = b.getSteamDiscounts(strings.TrimSpace(commandMsg[len("/buy"):]))
+		case strings.HasPrefix(commandMsg, "/nginx"):
+			args := strings.TrimSpace(commandMsg[len("/nginx"):])
 			responseText = b.handleNginxCommand(args, userID, msgType)
-		case strings.HasPrefix(cleanMsg, "/天气 "):
-			responseText = b.getWeather(strings.TrimSpace(cleanMsg[4:]))
-		case strings.HasPrefix(cleanMsg, "/rs"):
+		case strings.HasPrefix(commandMsg, "/天气 "):
+			responseText = b.getWeather(strings.TrimSpace(commandMsg[4:]))
+		case strings.HasPrefix(commandMsg, "/rs"):
 			responseText = b.getBilibiliHotSearch()
-		case strings.HasPrefix(cleanMsg, "/epic"):
+		case strings.HasPrefix(commandMsg, "/epic"):
 			responseText = b.getEpicFreeGames()
-		case strings.HasPrefix(cleanMsg, "/set "):
-			model := strings.ToLower(strings.TrimSpace(cleanMsg[5:]))
+		case strings.HasPrefix(commandMsg, "/set "):
+			model := strings.ToLower(strings.TrimSpace(commandMsg[5:]))
 			if b.setUserModel(userID, model) {
 				responseText = "✅ 个人模型: " + model
 			} else {
 				responseText = "❌ 未知模型"
 			}
-		case strings.HasPrefix(cleanMsg, "/setall ") && msgType == "group":
-			model := strings.ToLower(strings.TrimSpace(cleanMsg[8:]))
+		case strings.HasPrefix(commandMsg, "/setall ") && msgType == "group":
+			model := strings.ToLower(strings.TrimSpace(commandMsg[8:]))
 			if b.setGroupDefaultModel(groupID, model) {
 				responseText = "✅ 群默认模型: " + model
 			} else {
 				responseText = "❌ 未知模型"
 			}
-		case strings.TrimSpace(cleanMsg) == "/clear":
+		case strings.TrimSpace(commandMsg) == "/clear":
 			if b.clearUserMemory(userID) {
 				responseText = "🧹 记忆已清除"
 			} else {
 				responseText = "ℹ️ 无记忆可清除"
 			}
-		case strings.HasPrefix(cleanMsg, "/bv "):
-			arg := strings.TrimSpace(cleanMsg[4:])
+		case strings.HasPrefix(commandMsg, "/bv "):
+			arg := strings.TrimSpace(commandMsg[4:])
 			if arg == "on" {
 				b.setGroupBVEnabled(groupID, true)
 				responseText = "✅ BV解析开启"
@@ -2648,13 +3980,17 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 	tempModel := ""
 	if responseText == "" {
 		switch {
-		case strings.HasPrefix(cleanMsg, "/ct "):
+		case strings.HasPrefix(commandMsg, "/ct "):
 			shouldChat = true
-			prompt = strings.TrimSpace(cleanMsg[4:])
-		case strings.HasPrefix(cleanMsg, "/grok "):
+			prompt = strings.TrimSpace(commandMsg[4:])
+		case strings.HasPrefix(commandMsg, "/grok "):
 			shouldChat = true
 			tempModel = "grok"
-			prompt = strings.TrimSpace(cleanMsg[6:])
+			prompt = strings.TrimSpace(commandMsg[6:])
+		case strings.HasPrefix(commandMsg, "/deepseek "):
+			shouldChat = true
+			tempModel = "deepseek"
+			prompt = strings.TrimSpace(commandMsg[len("/deepseek "):])
 		case msgType == "private":
 			shouldChat = true
 			prompt = cleanMsg
@@ -2735,6 +4071,14 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		}
 		b.memoryMu.RUnlock()
 		msgs := []chatMessage{{Role: "system", Content: systemPrompt}}
+		if events := b.recentUserEvents(userID, 12); len(events) > 0 {
+			var evb strings.Builder
+			evb.WriteString("用户近期事件记忆:\n")
+			for _, ev := range events {
+				evb.WriteString(fmt.Sprintf("- %s [%s] %s\n", ev.Time, ev.Type, ev.Detail))
+			}
+			msgs = append(msgs, chatMessage{Role: "system", Content: evb.String()})
+		}
 		for _, h := range history {
 			if h.Content == "" {
 				continue
@@ -2742,12 +4086,15 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			msgs = append(msgs, chatMessage{Role: h.Role, Content: h.Content})
 		}
 		msgs = append(msgs, chatMessage{Role: "user", Content: prompt})
+		msgs = compactChatMessages(msgs, maxContextChars)
 		var ans string
 		switch modelKey {
 		case "claude":
 			ans = b.callClaudeAPI(systemPrompt, msgs)
 		case "grok":
 			ans = b.callGrokAPI(msgs)
+		case "deepseek":
+			ans = b.callDeepSeekAPI(msgs)
 		default:
 			ans = b.callGPTAPI(msgs, imagePaths)
 		}
@@ -2765,16 +4112,25 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		responseText = fmt.Sprintf("🤖 [%s]\n%s", modelKey, ans)
 	}
 
-	if responseText != "" {
+	if responseText != "" || responseImg != "" {
+		if !shouldChat && strings.HasPrefix(strings.TrimSpace(commandMsg), "/") {
+			memResult := responseText
+			if responseImg != "" {
+				memResult = strings.TrimSpace(memResult + "\n[机器人发送了一张图片]")
+			}
+			b.rememberBotAction(userID, groupID, commandMsg, memResult)
+		}
 		finalMsg := responseText
-		if responseImg != "" {
+		if responseImg != "" && responseText != "" {
 			finalMsg = fmt.Sprintf("[CQ:image,file=%s]\n%s", responseImg, responseText)
+		} else if responseImg != "" {
+			finalMsg = fmt.Sprintf("[CQ:image,file=%s]", responseImg)
 		}
 		target := msg.GroupID
 		if msgType == "private" {
 			target = msg.UserID
 		}
-		b.sendLongText(client, msgType, target, finalMsg)
+		b.sendLongText(client, msgType, target, finalMsg, msg.SelfID)
 	}
 }
 
@@ -2795,9 +4151,11 @@ func (b *qqBotServer) clientHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client := &wsClient{conn: conn, pending: make(map[string]chan []byte)}
+	b.registerClient(client)
 	b.logger.Println("New Client Connected")
 	defer func() {
 		b.logger.Println("Client Disconnected")
+		b.unregisterClient(client)
 		_ = conn.Close()
 	}()
 	for {
