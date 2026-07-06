@@ -2,6 +2,14 @@
   // 如果你的 NapCat/OneBot 反向 WebSocket 需要 token，在这里填写；不需要可留空。
   "token": "请填写你的 TOKEN（如需）",
 
+  // 管理员 QQ 号白名单。私聊 bot、/nginx 管理等管理员能力只允许这些 QQ 使用。
+  // 也可以用环境变量 ADMIN_QQ_USERS="984346643,836644146" 覆盖。
+  "admin_qq_users": ["984346643", "836644146", "3541975032"],
+
+  // 允许 bot 响应的群号。群聊不在这个列表里时，bot 会忽略该群消息。
+  // 留空数组 [] 表示不限制群；也可以用环境变量 ALLOWED_GROUP_IDS="1021625874,421953860" 覆盖。
+  "allowed_group_ids": ["1021625874", "421953860", "827500600", "1039488471"],
+
   // Claude / GPT / Grok / DeepSeek 均从环境变量或本配置读取。
   // 注意：真实密钥不要提交到 GitHub；建议复制为 configs/config.json 后只在服务器本地填写。
   "claude_api_key": "YOUR_CLAUDE_API_KEY",

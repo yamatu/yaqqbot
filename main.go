@@ -57,10 +57,10 @@ const (
 )
 
 // QQ 私聊白名单
-var allowedQQUsers = []string{"984346643", "836644146", "3541975032"}
+var allowedQQUsers = parseCSVEnvOrDefault("ADMIN_QQ_USERS", []string{"984346643", "836644146", "3541975032"})
 
 // 群聊白名单
-var allowedGroupIDs = []string{"1021625874", "421953860", "827500600", "1039488471"}
+var allowedGroupIDs = parseCSVEnvOrDefault("ALLOWED_GROUP_IDS", []string{"1021625874", "421953860", "827500600", "1039488471"})
 
 // API 配置（密钥从环境变量读取，避免硬编码）
 var (
@@ -369,7 +369,24 @@ func parseCSVEnv(key string) []string {
 	if raw == "" {
 		return nil
 	}
+	return parseStringList(raw)
+}
+
+func parseCSVEnvOrDefault(key string, def []string) []string {
+	if v := parseCSVEnv(key); len(v) > 0 {
+		return v
+	}
+	out := make([]string, 0, len(def))
+	out = append(out, def...)
+	return out
+}
+
+func parseStringList(raw string) []string {
 	parts := strings.Split(raw, ",")
+	return sanitizeIDList(parts)
+}
+
+func sanitizeIDList(parts []string) []string {
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
@@ -434,31 +451,33 @@ func stripJSONComments(input []byte) []byte {
 
 // fileConfig 对应 configs/config.json，用来从文件加载 API Key 等敏感配置。
 type fileConfig struct {
-	ClaudeAPIKey         string   `json:"claude_api_key"`
-	ClaudeAPIBase        string   `json:"claude_api_base"`
-	ClaudeModel          string   `json:"claude_model"`
-	GPTAPIKey            string   `json:"gpt_api_key"`
-	GPTAPIBase           string   `json:"gpt_api_base"`
-	GPTModel             string   `json:"gpt_model"`
-	GrokAPIKey           string   `json:"grok_api_key"`
-	GrokAPIBase          string   `json:"grok_api_base"`
-	GrokModel            string   `json:"grok_model"`
-	GeminiAPIKey         string   `json:"gemini_api_key"`
-	GeminiAPIBase        string   `json:"gemini_api_base"`
-	GeminiImageModel     string   `json:"gemini_image_model"`
-	DeepSeekAPIKey       string   `json:"deepseek_api_key"`
-	DeepSeekAPIBase      string   `json:"deepseek_api_base"`
-	DeepSeekModel        string   `json:"deepseek_model"`
-	SteamAPIKey          string   `json:"steam_api_key"`
-	SteamAPIBase         string   `json:"steam_api_base"`
-	SteamAPIKeyDomain    string   `json:"steam_api_key_domain"`
-	SteamMonitorGroups   []string `json:"steam_monitor_groups"`
-	SteamPollInterval    string   `json:"steam_poll_interval"`
-	LongForwardThreshold int      `json:"long_forward_threshold"`
-	MaxContextChars      int      `json:"max_context_chars"`
-	AMapAPIKey           string   `json:"amap_api_key"`
-	BilibiliAPIBase      string   `json:"bilibili_api_base"`
-	Socks5Proxy          string   `json:"socks5_proxy"`
+	AdminQQUsers         *[]string `json:"admin_qq_users"`
+	AllowedGroupIDs      *[]string `json:"allowed_group_ids"`
+	ClaudeAPIKey         string    `json:"claude_api_key"`
+	ClaudeAPIBase        string    `json:"claude_api_base"`
+	ClaudeModel          string    `json:"claude_model"`
+	GPTAPIKey            string    `json:"gpt_api_key"`
+	GPTAPIBase           string    `json:"gpt_api_base"`
+	GPTModel             string    `json:"gpt_model"`
+	GrokAPIKey           string    `json:"grok_api_key"`
+	GrokAPIBase          string    `json:"grok_api_base"`
+	GrokModel            string    `json:"grok_model"`
+	GeminiAPIKey         string    `json:"gemini_api_key"`
+	GeminiAPIBase        string    `json:"gemini_api_base"`
+	GeminiImageModel     string    `json:"gemini_image_model"`
+	DeepSeekAPIKey       string    `json:"deepseek_api_key"`
+	DeepSeekAPIBase      string    `json:"deepseek_api_base"`
+	DeepSeekModel        string    `json:"deepseek_model"`
+	SteamAPIKey          string    `json:"steam_api_key"`
+	SteamAPIBase         string    `json:"steam_api_base"`
+	SteamAPIKeyDomain    string    `json:"steam_api_key_domain"`
+	SteamMonitorGroups   []string  `json:"steam_monitor_groups"`
+	SteamPollInterval    string    `json:"steam_poll_interval"`
+	LongForwardThreshold int       `json:"long_forward_threshold"`
+	MaxContextChars      int       `json:"max_context_chars"`
+	AMapAPIKey           string    `json:"amap_api_key"`
+	BilibiliAPIBase      string    `json:"bilibili_api_base"`
+	Socks5Proxy          string    `json:"socks5_proxy"`
 }
 
 // loadConfigFromFile 从 JSON 配置文件加载配置，并覆盖默认的环境变量值。
@@ -478,6 +497,12 @@ func loadConfigFromFile(path string) {
 	}
 
 	// 仅当配置文件中对应字段非空时，才覆盖默认值
+	if cfg.AdminQQUsers != nil {
+		allowedQQUsers = sanitizeIDList(*cfg.AdminQQUsers)
+	}
+	if cfg.AllowedGroupIDs != nil {
+		allowedGroupIDs = sanitizeIDList(*cfg.AllowedGroupIDs)
+	}
 	if cfg.ClaudeAPIKey != "" {
 		claudeAPIKey = cfg.ClaudeAPIKey
 	}
