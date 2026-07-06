@@ -35,8 +35,8 @@ import (
 	"qq_client/internal/openaiutil"
 )
 
-// 本文件是对 qqbot_server.py 的 Golang 重写版本。
-// 目标尽量保持功能对等，但做了少量工程化调整（例如配置与密钥从环境变量读取）。
+// QQBot 的 Go 实现。
+// 当前版本在保持核心能力的基础上，补充了配置与密钥的工程化管理。
 
 // ============ 配置区域 ============
 
@@ -168,9 +168,8 @@ type cqMessage struct {
 
 // WebSocket 客户端封装，保证写操作串行。
 type wsClient struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
-
+	conn      *websocket.Conn
+	writeMu   sync.Mutex
 	pendingMu sync.Mutex
 	pending   map[string]chan []byte
 }
@@ -624,7 +623,6 @@ func newQQBotServer() *qqBotServer {
 
 	// 编译正则
 	reCQ := regexp.MustCompile(`\[CQ:[^\]]+\]`)
-	// image/mface 都可能携带图片；mface 在部分实现中可能单独作为 CQ 段类型上报。
 	reCQImage := regexp.MustCompile(`\[CQ:(?:image|mface),([^\]]+)\]`)
 	reCQReply := regexp.MustCompile(`\[CQ:reply,([^\]]+)\]`)
 	reBV := regexp.MustCompile(`BV[a-zA-Z0-9]{10}`)
@@ -2845,7 +2843,7 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
-func (b *qqBotServer) callGPTAPI(messages []chatMessage, imagePaths []string) string {
+func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 	if gptAPIKey == "" {
 		return "❌ GPT 未配置 API Key"
 	}
@@ -2854,8 +2852,8 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage, imagePaths []string) st
 
 	// 特殊处理：codex-api.packycode.com 明确限制“仅允许官方 Codex CLI 访问”。
 	// 这里不尝试伪装/绕过，而是直接调用本机 Codex CLI 来完成对话（需要你已安装并登录/配置）。
-	if len(imagePaths) > 0 || strings.Contains(strings.ToLower(apiBase), "codex-api.packycode.com") {
-		prompt := buildConversationPrompt(messages, len(imagePaths))
+	if strings.Contains(strings.ToLower(apiBase), "codex-api.packycode.com") {
+		prompt := buildConversationPrompt(messages)
 		out, err := codexcli.Exec(context.Background(), prompt, codexcli.ExecOptions{
 			Bin:     envOrDefault("CODEX_CLI_BIN", "codex"),
 			Model:   gptModel,
@@ -2863,7 +2861,6 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage, imagePaths []string) st
 			APIKey:  gptAPIKey,
 			EnvKey:  "GPT_API_KEY",
 			WireAPI: envOrDefault("CODEX_WIRE_API", "responses"),
-			Images:  imagePaths,
 			SkipGitRepoCheck: func() *bool {
 				v := envBoolOrDefault("CODEX_SKIP_GIT_REPO_CHECK", true)
 				return &v
@@ -2975,12 +2972,9 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage, imagePaths []string) st
 
 // buildConversationPrompt 把 messages 组装成适合“纯对话”的文本提示，供 codex exec 使用。
 // 约束：不引导其修改文件或执行命令，避免产生副作用。
-func buildConversationPrompt(messages []chatMessage, imageCount int) string {
+func buildConversationPrompt(messages []chatMessage) string {
 	var b strings.Builder
-	if imageCount > 0 {
-		b.WriteString(fmt.Sprintf("你是聊天助手。你将收到 %d 张图片作为附件（由系统通过 --image 提供）。请结合图片内容与对话历史回答。\n", imageCount))
-	}
-	b.WriteString("请不要执行任何命令、不要读写文件、不要修改仓库，只需要回答用户的最后一个问题。\n\n")
+	b.WriteString("你是聊天助手。请不要执行任何命令、不要读写文件、不要修改仓库，只需要回答用户的最后一个问题。\n\n")
 	for _, m := range messages {
 		role := strings.TrimSpace(m.Role)
 		content := strings.TrimSpace(m.Content)
@@ -3808,8 +3802,6 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		commandMsg = commandMsg[1:]
 	}
 	isAtMe := msgType == "group" && strings.Contains(rawMsg, "[CQ:at,qq="+selfID+"]")
-	hasImage := b.reCQImage.MatchString(rawMsg)
-	replyMsgID, hasReply := b.extractReplyMessageID(rawMsg)
 
 	var responseText string
 	var responseImg string
@@ -4000,53 +3992,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			prompt = strings.TrimSpace(regexp.MustCompile(`@\d+\s*`).ReplaceAllString(cleanMsg, ""))
 		}
 	}
-
-	imagePaths := []string(nil)
-	cleanups := []func(){}
-	if shouldChat {
-		// 1) 当前消息内的图片（CQ:image / CQ:mface）
-		if hasImage {
-			if paths, cleanup := b.saveIncomingImages(rawMsg); len(paths) > 0 {
-				imagePaths = append(imagePaths, paths...)
-				cleanups = append(cleanups, cleanup)
-			}
-		}
-
-		// 2) 群聊：当“@机器人 + 引用(reply)”时，尝试从被引用消息中提取图片。
-		// 说明：OneBot 的 reply 段只带 message_id，本条消息 raw_message 不一定包含图片段。
-		if msgType == "group" && isAtMe && hasReply && replyMsgID > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			data, err := client.Call(ctx, "get_msg", map[string]any{"message_id": replyMsgID})
-			cancel()
-			if err != nil {
-				b.logger.Printf("get_msg 失败（message_id=%d）: %v", replyMsgID, err)
-			} else {
-				var d struct {
-					Message any `json:"message"`
-				}
-				if err := json.Unmarshal(data, &d); err == nil {
-					if paths, cleanup := b.saveIncomingImagesFromOneBotMessage(d.Message); len(paths) > 0 {
-						imagePaths = append(imagePaths, paths...)
-						cleanups = append(cleanups, cleanup)
-					}
-				}
-			}
-		}
-	}
-	if len(cleanups) > 0 {
-		defer func() {
-			for _, fn := range cleanups {
-				fn()
-			}
-		}()
-	}
-
-	hasAnyImage := len(imagePaths) > 0
-	if shouldChat && strings.TrimSpace(prompt) == "" && hasAnyImage {
-		prompt = "请描述图片内容，并结合上下文回答我的问题。"
-	}
-
-	if shouldChat && strings.TrimSpace(prompt) != "" {
+	if shouldChat && prompt != "" {
 		groupIDPtr := (*string)(nil)
 		if groupID != "" {
 			groupIDPtr = &groupID
@@ -4054,10 +4000,6 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		modelKey := tempModel
 		if modelKey == "" {
 			modelKey = b.getUserModel(userID, groupIDPtr)
-		}
-		// 图片输入目前仅对 GPT(Codex CLI) 做了适配；避免 Claude/Grok 丢失图片信息。
-		if hasAnyImage {
-			modelKey = "gpt"
 		}
 		systemPrompt := b.modelPrompts[modelKey]
 		if systemPrompt == "" {
@@ -4096,18 +4038,9 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		case "deepseek":
 			ans = b.callDeepSeekAPI(msgs)
 		default:
-			ans = b.callGPTAPI(msgs, imagePaths)
+			ans = b.callGPTAPI(msgs)
 		}
-		// 记忆中不保存绝对路径，避免泄露本机路径细节。
-		memPrompt := prompt
-		if hasAnyImage {
-			if len(imagePaths) > 0 {
-				memPrompt = memPrompt + fmt.Sprintf("\n[用户发送了 %d 张图片]", len(imagePaths))
-			} else {
-				memPrompt = memPrompt + "\n[用户发送了图片]"
-			}
-		}
-		b.appendHistory(userID, "user", memPrompt)
+		b.appendHistory(userID, "user", prompt)
 		b.appendHistory(userID, "assistant", ans)
 		responseText = fmt.Sprintf("🤖 [%s]\n%s", modelKey, ans)
 	}
@@ -4166,18 +4099,7 @@ func (b *qqBotServer) clientHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		// 兼容处理：同一条 WS 连接上既会收到事件，也会收到 action 的响应（带 echo）。
-		var hint struct {
-			Echo     string `json:"echo"`
-			PostType string `json:"post_type"`
-		}
-		if err := json.Unmarshal(data, &hint); err == nil && hint.Echo != "" && hint.PostType == "" {
-			if client.fulfillEcho(hint.Echo, data) {
-				continue
-			}
-		}
-
-		// 每条事件消息单独 goroutine 处理，避免阻塞读取
+		// 每条消息单独 goroutine 处理，避免阻塞读取
 		payload := make([]byte, len(data))
 		copy(payload, data)
 		go b.processSingleMessage(client, payload)

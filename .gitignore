@@ -1,8 +1,6 @@
 qqbot.log
 user_memory.json
 nginx_servers.json
-__pycache__/
-*.pyc
 .DS_Store
 dist/
 
