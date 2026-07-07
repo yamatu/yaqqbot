@@ -27,11 +27,13 @@ function Get-PythonForGeminiSearch {
   )
 
   foreach ($candidate in $candidates) {
-    if (-not (Test-CommandExists $candidate.Command)) {
+    $command = $candidate["Command"]
+    $arguments = $candidate["Args"]
+    if (-not (Test-CommandExists $command)) {
       continue
     }
     try {
-      $version = & $candidate["Command"] @($candidate["Args"]) -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+      $version = & $command @arguments -c "import sys; print(str(sys.version_info.major) + '.' + str(sys.version_info.minor))"
       if (-not $version) {
         continue
       }
@@ -46,6 +48,10 @@ function Get-PythonForGeminiSearch {
     }
   }
   return $null
+}
+
+if (-not $env:LOCALAPPDATA) {
+  throw "LOCALAPPDATA is not set."
 }
 
 $baseDir = Join-Path $env:LOCALAPPDATA "gemini-search-mcp"
@@ -63,30 +69,33 @@ if (-not $ProxyServer -and $env:SOCKS5_PROXY) {
 
 if (-not (Test-Path $geminiSearchExe)) {
   if ($SkipInstall) {
-    throw "未找到 $geminiSearchExe，并且指定了 -SkipInstall。"
+    throw "gemini-search.exe was not found and -SkipInstall was specified: $geminiSearchExe"
   }
 
   $python = Get-PythonForGeminiSearch
   if (-not $python) {
     throw @"
-未找到 Python 3.10+。
-请先在 Windows PowerShell 里安装:
+Python 3.10+ was not found.
+Install it in Windows PowerShell:
   winget install Python.Python.3.12
 
-安装后重新打开 PowerShell，再运行:
+Then reopen PowerShell and run:
   .\scripts\start_gemini_search_mcp.ps1
 "@
   }
 
+  $pythonCommand = $python["Command"]
+  $pythonArgs = $python["Args"]
+
   New-Item -ItemType Directory -Force -Path $baseDir | Out-Null
-  Write-Host "正在创建 gemini-search-mcp venv: $venvDir"
-  & $python["Command"] @($python["Args"]) -m venv $venvDir
+  Write-Host "Creating gemini-search-mcp venv: $venvDir"
+  & $pythonCommand @pythonArgs -m venv $venvDir
 
   $venvPython = Join-Path $venvDir "Scripts\python.exe"
-  Write-Host "正在升级 pip..."
+  Write-Host "Upgrading pip..."
   & $venvPython -m pip install --upgrade pip
 
-  Write-Host "正在安装 gemini-search-mcp..."
+  Write-Host "Installing gemini-search-mcp..."
   & $venvPython -m pip install "https://github.com/Sophomoresty/gemini-search-mcp/archive/refs/heads/main.zip"
 }
 
@@ -114,6 +123,6 @@ if ($env:GEMINI_SEARCH_CHROMEDRIVER) {
   $argsList += @("--chromedriver-path", $env:GEMINI_SEARCH_CHROMEDRIVER)
 }
 
-Write-Host "启动 gemini-search-mcp: http://127.0.0.1:$Port/v1"
+Write-Host "Starting gemini-search-mcp: http://127.0.0.1:$Port/v1"
 Write-Host "Chrome profile: $UserDataDir"
 & $geminiSearchExe @argsList
