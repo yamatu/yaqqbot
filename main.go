@@ -930,6 +930,14 @@ func (b *qqBotServer) rememberBotAction(qq, groupID, command, result string) {
 	b.appendUserEvent(qq, groupID, "bot_command", fmt.Sprintf("执行命令: %s；结果: %s", command, result))
 }
 
+func trimForMemory(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit > 0 && len(text) > limit {
+		return text[:limit] + "...(已截断)"
+	}
+	return text
+}
+
 func (b *qqBotServer) recentUserEvents(qq string, limit int) []userEvent {
 	b.memoryMu.RLock()
 	defer b.memoryMu.RUnlock()
@@ -2334,6 +2342,20 @@ func (b *qqBotServer) searchContextForPrompt(prompt string) (string, error) {
 		answer, nil
 }
 
+func buildDeepSeekPromptWithSearch(userPrompt, searchCtx string) string {
+	var sb strings.Builder
+	sb.WriteString("请先阅读下面的【联网搜索结果】，再回答【用户问题】。\n\n")
+	sb.WriteString("要求：\n")
+	sb.WriteString("1. 涉及最新信息、新闻、价格、版本、政策、人物/公司状态时，优先使用联网搜索结果。\n")
+	sb.WriteString("2. 如果联网搜索结果和你的旧知识冲突，以联网搜索结果为准，并说明可能存在时效性。\n")
+	sb.WriteString("3. 回答要直接、中文、可执行；必要时引用搜索结果中的来源链接。\n\n")
+	sb.WriteString("【联网搜索结果】\n")
+	sb.WriteString(strings.TrimSpace(searchCtx))
+	sb.WriteString("\n\n【用户问题】\n")
+	sb.WriteString(strings.TrimSpace(userPrompt))
+	return sb.String()
+}
+
 func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	rawURL = strings.TrimSpace(rawURL)
 	u, err := url.Parse(rawURL)
@@ -3720,6 +3742,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		b.memoryMu.RUnlock()
 		msgs := []chatMessage{{Role: "system", Content: systemPrompt}}
 		searchStatusText := ""
+		finalUserPrompt := prompt
 		if events := b.recentUserEvents(userID, 12); len(events) > 0 {
 			var evb strings.Builder
 			evb.WriteString("用户近期事件记忆:\n")
@@ -3734,6 +3757,9 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			searchStatusText = "🌐 已结合联网搜索\n"
 			if modelKey == "deepseek" {
 				msgs = append(msgs, chatMessage{Role: "system", Content: "DeepSeek 联网要求：本轮已提供实时联网搜索摘要。回答时必须结合该摘要；涉及时效性事实时，不要只使用 DeepSeek 训练数据。"})
+				finalUserPrompt = buildDeepSeekPromptWithSearch(prompt, searchCtx)
+				b.appendHistory(userID, "system", "联网搜索结果记忆: "+trimForMemory(searchCtx, 1800))
+				b.appendUserEvent(userID, groupID, "web_search", fmt.Sprintf("问题: %s；结果: %s", trimForMemory(prompt, 200), trimForMemory(searchCtx, 800)))
 			}
 		} else if searchErr != nil {
 			b.logger.Printf("联网搜索摘要生成失败 model=%s user=%s group=%s: %v", modelKey, userID, groupID, searchErr)
@@ -3748,7 +3774,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			}
 			msgs = append(msgs, chatMessage{Role: h.Role, Content: h.Content})
 		}
-		msgs = append(msgs, chatMessage{Role: "user", Content: prompt})
+		msgs = append(msgs, chatMessage{Role: "user", Content: finalUserPrompt})
 		msgs = compactChatMessages(msgs, maxContextChars)
 		var ans string
 		switch modelKey {
