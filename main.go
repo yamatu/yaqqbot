@@ -2163,9 +2163,39 @@ func (b *qqBotServer) searchSearxng(query, categories, timeRange string, limit i
 	if limit <= 0 {
 		limit = 6
 	}
+	results, err := b.searchSearxngOnce(query, categories, timeRange, limit)
+	if err == nil || categories != "news" {
+		return results, err
+	}
+	// searxng2api 只支持 general/images，不支持 news；新闻请求失败时降级为 general。
+	return b.searchSearxngOnce(query, "general", timeRange, limit)
+}
+
+func searxSearchURL() (string, error) {
+	raw := strings.TrimSpace(searxngAPIBase)
+	if raw == "" {
+		return "", errors.New("未配置 SearXNG 地址（SEARXNG_API_BASE / searxng_api_base）")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("SearXNG 地址不合法: %s", raw)
+	}
+	path := strings.TrimRight(u.Path, "/")
+	if path == "" || path == "/" {
+		u.Path = "/search"
+	} else if !strings.HasSuffix(path, "/search") {
+		u.Path = path + "/search"
+	}
+	return u.String(), nil
+}
+
+func (b *qqBotServer) searchSearxngOnce(query, categories, timeRange string, limit int) ([]searxResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	base := strings.TrimRight(searxngAPIBase, "/") + "/search"
+	base, err := searxSearchURL()
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base, nil)
 	if err != nil {
 		return nil, err

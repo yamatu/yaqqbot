@@ -56,9 +56,9 @@
   // B 站视频解析接口；失败时会回退到网页爬取。
   "bilibili_api_base": "https://api.bilibili.com/x/web-interface/view",
 
-  // SearXNG 搜索 API 地址。配置后所有 AI 对话都会自动附加联网搜索摘要，也可用 /search 和 /news。
-  // 你的 SearXNG 实例需要开启 JSON 格式输出。
-  "searxng_api_base": "https://你的-searxng.example.com",
+  // SearXNG / searxng2api 搜索 API 地址。可填根地址，也可填完整 /search 地址。
+  // 原生 SearXNG 需要允许 format=json；searxng2api 只支持 general/images，/news 会自动降级搜索。
+  "searxng_api_base": "https://你的-searxng2api.example.com",
 
   // 60s 聚合 API。/epic、/60s、/ainews 会使用这个接口。
   "sixty_api_base": "https://60s.viki.moe",

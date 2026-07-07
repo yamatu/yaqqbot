@@ -147,8 +147,9 @@ Steam 配置：
 
 联网搜索配置：
 
-- `SEARXNG_API_BASE` / `searxng_api_base`：SearXNG 实例地址，例如 `https://search.example.com`
-- SearXNG 实例需要允许 `format=json`
+- `SEARXNG_API_BASE` / `searxng_api_base`：SearXNG 或 searxng2api 地址，例如 `https://search.example.com` 或 `https://search.example.com/search`
+- 原生 SearXNG 需要允许 `format=json`
+- searxng2api 只支持 `general/images`，`/news` 会自动降级为 `general` 搜索
 - 配置后任意 AI 模型对话都会自动附加 SearXNG 搜索摘要；显式搜索可用 `/search`、`/news`
 
 60s 聚合 API 配置：
