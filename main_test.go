@@ -95,3 +95,21 @@ func TestNormalizeChatCompletionsBaseForGrok(t *testing.T) {
 		t.Fatalf("unexpected normalized full URL: %s", got)
 	}
 }
+
+func TestParseOpenAIStreamContent(t *testing.T) {
+	body := []byte(`data: {"choices":[{"delta":{"role":"assistant","content":"**"}}]}
+
+data: {"choices":[{"delta":{"content":"结论"}}]}
+
+data: {"choices":[{"delta":{"content":"**：可以使用。"}}]}
+
+data: [DONE]
+`)
+	got, err := parseOpenAIStreamContent(body)
+	if err != nil {
+		t.Fatalf("parse stream failed: %v", err)
+	}
+	if got != "**结论**：可以使用。" {
+		t.Fatalf("unexpected stream content: %q", got)
+	}
+}
