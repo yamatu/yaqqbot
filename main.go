@@ -2753,6 +2753,43 @@ func normalizeChatCompletionsBase(raw string) string {
 	return base + "/v1"
 }
 
+func parseOpenAIStreamContent(body []byte) (string, error) {
+	var parts []string
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				Message chatMessage `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return "", err
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				parts = append(parts, choice.Delta.Content)
+			} else if choice.Message.Content != "" {
+				parts = append(parts, choice.Message.Content)
+			}
+		}
+	}
+	answer := strings.TrimSpace(strings.Join(parts, ""))
+	if answer == "" {
+		return "", errors.New("stream 内容为空")
+	}
+	return answer, nil
+}
+
 func (b *qqBotServer) callGrokAPI(messages []chatMessage) string {
 	if grokAPIKey == "" {
 		return "❌ Grok 未配置 API Key"
@@ -2782,6 +2819,13 @@ func (b *qqBotServer) callGrokAPI(messages []chatMessage) string {
 	}
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	trimmed := strings.TrimSpace(string(body))
+	if strings.Contains(ct, "text/event-stream") || strings.HasPrefix(trimmed, "data:") {
+		answer, err := parseOpenAIStreamContent(body)
+		if err != nil {
+			return fmt.Sprintf("❌ Grok 流式响应解析失败: %v\n接口: %s\n响应片段: %s", err, url, trimForMemory(trimmed, 500))
+		}
+		return answer
+	}
 	if strings.HasPrefix(trimmed, "<") || (ct != "" && !strings.Contains(ct, "json")) {
 		return fmt.Sprintf("❌ Grok 返回的不是 JSON，可能是 grok_api_base 配错或被网关/反代拦截。\n当前接口: %s\nContent-Type: %s\n响应片段: %s", url, resp.Header.Get("Content-Type"), trimForMemory(trimmed, 500))
 	}
