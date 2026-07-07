@@ -26,3 +26,16 @@ func TestCompactChatMessagesPreservesLeadingSystemSearchContext(t *testing.T) {
 		t.Fatalf("search context system message was not preserved: %#v", compact[1])
 	}
 }
+
+func TestBuildDeepSeekPromptWithSearchIncludesSearchAndQuestion(t *testing.T) {
+	prompt := buildDeepSeekPromptWithSearch("谷歌公司创始时间", "联网搜索摘要: Google founded in 1998-09-04")
+	if !strings.Contains(prompt, "【联网搜索结果】") {
+		t.Fatalf("missing search section: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Google founded in 1998-09-04") {
+		t.Fatalf("missing search content: %s", prompt)
+	}
+	if !strings.Contains(prompt, "谷歌公司创始时间") {
+		t.Fatalf("missing user question: %s", prompt)
+	}
+}
