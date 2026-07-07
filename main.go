@@ -100,10 +100,12 @@ var (
 	maxContextChars      = envIntOrDefault("MAX_CONTEXT_CHARS", 24000)
 	wsListenAddr         = envOrDefault("WS_LISTEN_ADDR", "0.0.0.0:8765")
 
-	amapAPIKey      = os.Getenv("AMAP_API_KEY")
-	bilibiliAPIBase = envOrDefault("BILIBILI_API_BASE", "https://api.bilibili.com/x/web-interface/view")
-	searxngAPIBase  = envOrDefault("SEARXNG_API_BASE", "")
-	sixtyAPIBase    = envOrDefault("SIXTY_API_BASE", "https://60s.viki.moe")
+	amapAPIKey          = os.Getenv("AMAP_API_KEY")
+	bilibiliAPIBase     = envOrDefault("BILIBILI_API_BASE", "https://api.bilibili.com/x/web-interface/view")
+	sixtyAPIBase        = envOrDefault("SIXTY_API_BASE", "https://60s.viki.moe")
+	geminiSearchAPIBase = envOrDefault("GEMINI_SEARCH_API_BASE", "")
+	geminiSearchAPIKey  = os.Getenv("GEMINI_SEARCH_API_KEY")
+	geminiSearchModel   = envOrDefault("GEMINI_SEARCH_MODEL", "gemini-search")
 
 	// SOCKS5/HTTP 代理（例如 socks5://127.0.0.1:41457 或 http://127.0.0.1:1080）
 	socks5Proxy  = os.Getenv("SOCKS5_PROXY")
@@ -475,7 +477,9 @@ type fileConfig struct {
 	WSListenAddr         string    `json:"ws_listen_addr"`
 	AMapAPIKey           string    `json:"amap_api_key"`
 	BilibiliAPIBase      string    `json:"bilibili_api_base"`
-	SearxngAPIBase       string    `json:"searxng_api_base"`
+	GeminiSearchAPIBase  string    `json:"gemini_search_api_base"`
+	GeminiSearchAPIKey   string    `json:"gemini_search_api_key"`
+	GeminiSearchModel    string    `json:"gemini_search_model"`
 	SixtyAPIBase         string    `json:"sixty_api_base"`
 	Socks5Proxy          string    `json:"socks5_proxy"`
 	ProxyEnabled         *bool     `json:"proxy_enabled"`
@@ -586,8 +590,14 @@ func loadConfigFromFile(path string) {
 	if cfg.BilibiliAPIBase != "" {
 		bilibiliAPIBase = cfg.BilibiliAPIBase
 	}
-	if cfg.SearxngAPIBase != "" {
-		searxngAPIBase = cfg.SearxngAPIBase
+	if cfg.GeminiSearchAPIBase != "" {
+		geminiSearchAPIBase = cfg.GeminiSearchAPIBase
+	}
+	if cfg.GeminiSearchAPIKey != "" {
+		geminiSearchAPIKey = cfg.GeminiSearchAPIKey
+	}
+	if cfg.GeminiSearchModel != "" {
+		geminiSearchModel = cfg.GeminiSearchModel
 	}
 	if cfg.SixtyAPIBase != "" {
 		sixtyAPIBase = cfg.SixtyAPIBase
@@ -2192,112 +2202,78 @@ func (b *qqBotServer) getSteamDiscounts(query string) string {
 	return strings.Join(lines, "\n")
 }
 
-type searxResult struct {
-	Title   string `json:"title"`
-	URL     string `json:"url"`
-	Content string `json:"content"`
-	Engine  string `json:"engine"`
-}
-
-func (b *qqBotServer) searchSearxng(query, categories, timeRange string, limit int) ([]searxResult, error) {
-	if strings.TrimSpace(searxngAPIBase) == "" {
-		return nil, errors.New("未配置 SearXNG 地址（SEARXNG_API_BASE / searxng_api_base）")
-	}
-	if limit <= 0 {
-		limit = 6
-	}
-	results, err := b.searchSearxngOnce(query, categories, timeRange, limit)
-	if err == nil || categories != "news" {
-		return results, err
-	}
-	// searxng2api 只支持 general/images，不支持 news；新闻请求失败时降级为 general。
-	return b.searchSearxngOnce(query, "general", timeRange, limit)
-}
-
-func searxSearchURL() (string, error) {
-	raw := strings.TrimSpace(searxngAPIBase)
+func geminiSearchURL() (string, error) {
+	raw := strings.TrimSpace(geminiSearchAPIBase)
 	if raw == "" {
-		return "", errors.New("未配置 SearXNG 地址（SEARXNG_API_BASE / searxng_api_base）")
+		return "", errors.New("未配置 Gemini Search 地址（GEMINI_SEARCH_API_BASE / gemini_search_api_base）")
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("SearXNG 地址不合法: %s", raw)
+		return "", fmt.Errorf("Gemini Search 地址不合法: %s", raw)
 	}
 	path := strings.TrimRight(u.Path, "/")
-	if path == "" || path == "/" {
-		u.Path = "/search"
-	} else if !strings.HasSuffix(path, "/search") {
-		u.Path = path + "/search"
+	switch {
+	case strings.HasSuffix(path, "/chat/completions"):
+		u.Path = path
+	case strings.HasSuffix(path, "/v1"):
+		u.Path = path + "/chat/completions"
+	case path == "" || path == "/":
+		u.Path = "/v1/chat/completions"
+	default:
+		u.Path = path + "/v1/chat/completions"
 	}
 	return u.String(), nil
 }
 
-func (b *qqBotServer) searchSearxngOnce(query, categories, timeRange string, limit int) ([]searxResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+func (b *qqBotServer) callGeminiSearch(prompt string) (string, error) {
+	apiURL, err := geminiSearchURL()
+	if err != nil {
+		return "", err
+	}
+	model := strings.TrimSpace(geminiSearchModel)
+	if model == "" {
+		model = "gemini-search"
+	}
+	reqBody := map[string]any{
+		"model": model,
+		"messages": []chatMessage{
+			{Role: "system", Content: "你是联网搜索助手。请基于实时搜索结果回答，列出关键信息和来源链接；如果没有可靠结果，请明确说明。"},
+			{Role: "user", Content: prompt},
+		},
+		"temperature": 0.2,
+	}
+	data, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	base, err := searxSearchURL()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base, nil)
-	if err != nil {
-		return nil, err
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(geminiSearchAPIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(geminiSearchAPIKey))
 	}
-	q := req.URL.Query()
-	q.Set("q", query)
-	q.Set("format", "json")
-	q.Set("language", "zh-CN")
-	q.Set("safesearch", "0")
-	if categories != "" {
-		q.Set("categories", categories)
-	}
-	if timeRange != "" {
-		q.Set("time_range", timeRange)
-	}
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("User-Agent", "yaqqbot/1.0")
 	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("SearXNG status=%d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("Gemini Search status=%d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var raw struct {
-		Results []searxResult `json:"results"`
+		Choices []struct {
+			Message chatMessage `json:"message"`
+		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
+		return "", err
 	}
-	if len(raw.Results) > limit {
-		raw.Results = raw.Results[:limit]
+	if len(raw.Choices) == 0 || strings.TrimSpace(raw.Choices[0].Message.Content) == "" {
+		return "", errors.New("Gemini Search 返回为空")
 	}
-	return raw.Results, nil
-}
-
-func formatSearxResults(title string, results []searxResult) string {
-	if len(results) == 0 {
-		return "ℹ️ 没有搜索到结果"
-	}
-	lines := []string{title}
-	for i, r := range results {
-		itemTitle := strings.TrimSpace(r.Title)
-		if itemTitle == "" {
-			itemTitle = strings.TrimSpace(r.URL)
-		}
-		snippet := strings.TrimSpace(r.Content)
-		if len(snippet) > 180 {
-			snippet = snippet[:180] + "..."
-		}
-		line := fmt.Sprintf("%d. %s\n%s", i+1, itemTitle, strings.TrimSpace(r.URL))
-		if snippet != "" {
-			line += "\n" + snippet
-		}
-		lines = append(lines, line)
-	}
-	return strings.Join(lines, "\n\n")
+	return strings.TrimSpace(raw.Choices[0].Message.Content), nil
 }
 
 func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
@@ -2308,43 +2284,28 @@ func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
 		}
 		return "❌ 用法: /search 关键词"
 	}
-	categories := "general"
-	timeRange := ""
-	title := "🔎 搜索结果:"
+	prompt := query
+	title := "🔎 联网搜索"
 	if news {
-		categories = "news"
-		timeRange = "week"
-		title = "📰 新闻搜索结果:"
+		prompt = "请搜索并总结最新新闻/事件：" + query
+		title = "📰 新闻搜索"
 	}
-	results, err := b.searchSearxng(query, categories, timeRange, 8)
+	answer, err := b.callGeminiSearch(prompt)
 	if err != nil {
 		return "❌ 搜索失败: " + err.Error()
 	}
-	return formatSearxResults(title, results)
+	return title + ":\n" + answer
 }
 
 func (b *qqBotServer) searchContextForPrompt(prompt string) string {
-	if strings.TrimSpace(searxngAPIBase) == "" || strings.TrimSpace(prompt) == "" {
+	if strings.TrimSpace(geminiSearchAPIBase) == "" || strings.TrimSpace(prompt) == "" {
 		return ""
 	}
-	categories := "general"
-	timeRange := ""
-	lower := strings.ToLower(prompt)
-	if strings.Contains(prompt, "新闻") || strings.Contains(prompt, "最新") || strings.Contains(prompt, "今天") ||
-		strings.Contains(prompt, "最近") || strings.Contains(lower, "news") || strings.Contains(lower, "latest") {
-		categories = "news"
-		timeRange = "week"
-	}
-	results, err := b.searchSearxng(prompt, categories, timeRange, 5)
-	if err != nil || len(results) == 0 {
+	answer, err := b.callGeminiSearch("请为下面的问题搜索实时资料，输出简短摘要和来源链接，供另一个 AI 回答时参考：\n" + prompt)
+	if err != nil || strings.TrimSpace(answer) == "" {
 		return ""
 	}
-	var sb strings.Builder
-	sb.WriteString("联网搜索结果（来自 SearXNG，请结合但不要盲信；涉及时间敏感问题优先参考这些结果）：\n")
-	for i, r := range results {
-		sb.WriteString(fmt.Sprintf("%d. %s\nURL: %s\n摘要: %s\n", i+1, strings.TrimSpace(r.Title), strings.TrimSpace(r.URL), strings.TrimSpace(r.Content)))
-	}
-	return sb.String()
+	return "联网搜索摘要（来自 gemini-search-mcp，请结合但不要盲信；涉及时间敏感问题优先参考这些结果）：\n" + answer
 }
 
 func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
@@ -3477,8 +3438,8 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				"/deepseek [问题]     - 使用 DeepSeek agent\n" +
 				"/img [尺寸] [提示词] - GPT 图片生成，如 /img 1024x1024 赛博城市\n" +
 				"/gimg [尺寸] [提示词] - Gemini 图片生成\n" +
-				"/search [关键词]     - SearXNG 联网搜索\n" +
-				"/news [关键词]       - SearXNG 新闻搜索\n" +
+				"/search [关键词]     - Gemini Search 联网搜索\n" +
+				"/news [关键词]       - Gemini Search 新闻搜索\n" +
 				"/60s                 - 60s 读懂世界图片\n" +
 				"/ainews              - AI 资讯快报图片\n" +
 				"//web [URL]          - 无头浏览器打开网页并截图\n" +
