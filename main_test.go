@@ -39,3 +39,15 @@ func TestBuildDeepSeekPromptWithSearchIncludesSearchAndQuestion(t *testing.T) {
 		t.Fatalf("missing user question: %s", prompt)
 	}
 }
+
+func TestBuildDetailedSearchPromptRequestsSpecificDetails(t *testing.T) {
+	prompt := buildDetailedSearchPrompt("NiKo夺冠", false, true)
+	for _, want := range []string{"详细事实", "电竞", "赛事名称", "比分", "来源"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("search prompt missing %q: %s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "简短摘要") {
+		t.Fatalf("search prompt should not ask for short summary: %s", prompt)
+	}
+}
