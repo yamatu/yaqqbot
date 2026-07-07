@@ -154,6 +154,7 @@ Steam 配置：
 - gemini-search-mcp 需要 Chrome/Edge/Chromium；如果 Windows 机器没有浏览器内核，先运行 `winget install Google.Chrome`
 - 如果首次启动遇到 `Google CAPTCHA during warmup`，先运行 `scripts\prime_gemini_search_chrome.bat`，在弹出的 Chrome 中完成验证后关闭或保留窗口，再正常运行 `scripts\start_gemini_search_mcp.bat`
 - 如果无头模式仍触发 CAPTCHA，运行 `scripts\start_gemini_search_mcp_cdp.bat`；它会先打开可见 Chrome，等你完成验证并按回车后，通过 `CDP_URL=http://127.0.0.1:9222` 连接这个 Chrome 启动搜索服务
+- 如果出现 `Cannot connect to Chrome at http://127.0.0.1:9223`，说明该端口没有 Chrome DevTools 在监听；重新运行 `scripts\start_gemini_search_mcp_cdp.bat`，不要关闭弹出的 Chrome，或先执行 `set GEMINI_SEARCH_CDP_PORT=9222` 换回默认端口
 - 如需代理 Google 搜索侧流量，可设置 `$env:GEMINI_SEARCH_PROXY_SERVER="socks5://127.0.0.1:7890"`；脚本也会在该变量为空时复用 `SOCKS5_PROXY`
 - macOS/Linux 可运行：`scripts/start_gemini_search_mcp.sh`
 - `GEMINI_SEARCH_API_BASE` / `gemini_search_api_base`：gemini-search-mcp 的 OpenAI 兼容接口地址，默认 `http://127.0.0.1:8080`；也可填 `http://127.0.0.1:8080/v1` 或完整 `/v1/chat/completions`

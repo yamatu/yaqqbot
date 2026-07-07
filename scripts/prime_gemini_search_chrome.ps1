@@ -34,6 +34,27 @@ function Find-ChromeExecutable {
   return $null
 }
 
+function Wait-CdpReady {
+  param(
+    [int]$Port,
+    [int]$TimeoutSeconds = 30
+  )
+
+  $url = "http://127.0.0.1:$Port/json/version"
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $response = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 2
+      if ($response.StatusCode -eq 200) {
+        return $true
+      }
+    } catch {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  return $false
+}
+
 if (-not $env:LOCALAPPDATA) {
   throw "LOCALAPPDATA is not set."
 }
@@ -55,6 +76,7 @@ New-Item -ItemType Directory -Force -Path $UserDataDir | Out-Null
 
 $argsList = @(
   "--user-data-dir=$UserDataDir",
+  "--remote-debugging-address=127.0.0.1",
   "--remote-debugging-port=$DebugPort",
   "--no-first-run",
   "--new-window",
@@ -71,3 +93,14 @@ Write-Host "CDP: http://127.0.0.1:$DebugPort"
 Write-Host "If Google shows CAPTCHA, finish it in this Chrome window."
 Write-Host "Keep this Chrome window open if you want to start gemini-search-mcp with CDP_URL."
 Start-Process -FilePath $chrome -ArgumentList $argsList
+
+if (-not (Wait-CdpReady -Port $DebugPort -TimeoutSeconds 30)) {
+  throw @"
+Chrome started, but CDP is not listening on http://127.0.0.1:$DebugPort/json/version.
+Close Chrome/Edge windows that use this profile and run this script again.
+If port $DebugPort is occupied, set another port first:
+  set GEMINI_SEARCH_CDP_PORT=9222
+"@
+}
+
+Write-Host "CDP is ready: http://127.0.0.1:$DebugPort"
