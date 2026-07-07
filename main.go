@@ -2304,7 +2304,87 @@ func buildDetailedSearchPrompt(query string, news bool, forAgent bool) string {
 	sb.WriteString("3. 如果问题涉及电竞/体育赛事，必须尽量列出赛事名称、日期、对阵双方、比分/名次、选手所属队伍、冠军/奖项和后续影响。\n")
 	sb.WriteString("4. 如果搜索结果存在不同说法，分别列出并说明来源差异。\n")
 	sb.WriteString("5. 最后列出来源链接或来源名称；不要省略来源。\n")
+	if isProjectDiscoveryQuery(query) {
+		sb.WriteString("6. 如果问题是在找 GitHub/开源/好玩的项目，必须列出具体项目名、仓库名 owner/repo、github.com 链接、主要功能、活跃度或 stars/更新时间等可用信息；禁止只写趋势总结。\n")
+	}
 	return sb.String()
+}
+
+func isProjectDiscoveryQuery(query string) bool {
+	q := strings.ToLower(query)
+	return strings.Contains(q, "github") || strings.Contains(q, "repo") || strings.Contains(q, "repository") ||
+		strings.Contains(query, "开源") || strings.Contains(query, "仓库") || strings.Contains(query, "项目")
+}
+
+func countRegexpMatches(pattern, text string) int {
+	return len(regexp.MustCompile(pattern).FindAllString(text, -1))
+}
+
+func lowDetailSearchReason(query, answer string) string {
+	answer = strings.TrimSpace(answer)
+	if len([]rune(answer)) < 80 {
+		return "内容过短"
+	}
+	lowerAnswer := strings.ToLower(answer)
+	if isProjectDiscoveryQuery(query) {
+		hasGitHubURL := strings.Contains(lowerAnswer, "github.com/")
+		repoMentions := countRegexpMatches(`\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\b`, answer)
+		if !hasGitHubURL && repoMentions < 2 {
+			return "缺少具体 GitHub 仓库名或链接"
+		}
+	}
+	genericPhrases := []string{"许多", "几个", "一些", "趋势", "主要体现", "以下为您整理了几个", "功能强大"}
+	genericHits := 0
+	for _, phrase := range genericPhrases {
+		if strings.Contains(answer, phrase) {
+			genericHits++
+		}
+	}
+	listMarkers := countRegexpMatches(`(?m)^\s*(?:[-*]|\d+[.)、])\s+`, answer)
+	if genericHits >= 2 && listMarkers == 0 {
+		return "结果过于概括，缺少条目化事实"
+	}
+	return ""
+}
+
+func buildSearchRetryPrompt(query, firstAnswer, reason string, news bool, forAgent bool) string {
+	var sb strings.Builder
+	sb.WriteString(buildDetailedSearchPrompt(query, news, forAgent))
+	sb.WriteString("\n\n上一次搜索结果不合格，原因: ")
+	sb.WriteString(reason)
+	sb.WriteString("。\n")
+	sb.WriteString("上一次结果:\n")
+	sb.WriteString(trimForMemory(firstAnswer, 1200))
+	sb.WriteString("\n\n请重新联网搜索。必须输出具体实体、名称、链接和可核验细节；不要再输出空泛趋势总结。")
+	if isProjectDiscoveryQuery(query) {
+		sb.WriteString(" 对 GitHub/开源项目问题，至少列出 5 个具体仓库，格式为：项目名 | owner/repo | 链接 | 功能 | stars/更新时间/活跃度。")
+	}
+	return sb.String()
+}
+
+func (b *qqBotServer) callDetailedGeminiSearch(query string, news bool, forAgent bool, strict bool) (string, error) {
+	answer, err := b.callGeminiSearch(buildDetailedSearchPrompt(query, news, forAgent))
+	if err != nil {
+		return "", err
+	}
+	if reason := lowDetailSearchReason(query, answer); reason != "" {
+		retry, retryErr := b.callGeminiSearch(buildSearchRetryPrompt(query, answer, reason, news, forAgent))
+		if retryErr == nil && strings.TrimSpace(retry) != "" {
+			retryReason := lowDetailSearchReason(query, retry)
+			if retryReason == "" {
+				return retry, nil
+			}
+			if len([]rune(retry)) > len([]rune(answer)) {
+				answer = retry
+				reason = retryReason
+			}
+		}
+		if strict {
+			return "", fmt.Errorf("Gemini Search 结果质量不足: %s", reason)
+		}
+		return "⚠️ 搜索结果可能过于概括（" + reason + "），已尝试重搜。\n" + answer, nil
+	}
+	return answer, nil
 }
 
 func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
@@ -2315,12 +2395,11 @@ func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
 		}
 		return "❌ 用法: /search 关键词"
 	}
-	prompt := buildDetailedSearchPrompt(query, news, false)
 	title := "🔎 联网搜索"
 	if news {
 		title = "📰 新闻搜索"
 	}
-	answer, err := b.callGeminiSearch(prompt)
+	answer, err := b.callDetailedGeminiSearch(query, news, false, false)
 	if err != nil {
 		return "❌ 搜索失败: " + err.Error()
 	}
@@ -2352,7 +2431,7 @@ func (b *qqBotServer) searchContextForPrompt(prompt string) (string, error) {
 	if strings.TrimSpace(geminiSearchAPIBase) == "" || strings.TrimSpace(prompt) == "" {
 		return "", errors.New("Gemini Search 未配置或问题为空")
 	}
-	answer, err := b.callGeminiSearch(buildDetailedSearchPrompt(prompt, false, true))
+	answer, err := b.callDetailedGeminiSearch(prompt, false, true, true)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		if err == nil {
 			err = errors.New("Gemini Search 返回为空")

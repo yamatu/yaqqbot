@@ -51,3 +51,17 @@ func TestBuildDetailedSearchPromptRequestsSpecificDetails(t *testing.T) {
 		t.Fatalf("search prompt should not ask for short summary: %s", prompt)
 	}
 }
+
+func TestLowDetailSearchReasonRejectsGenericProjectSummary(t *testing.T) {
+	answer := "在2026年7月，GitHub上涌现了许多好玩且功能强大的开源项目。上述项目主要体现了向自托管、代理自动化和多代理协作演进的趋势。"
+	if reason := lowDetailSearchReason("github 好玩的开源项目", answer); reason == "" {
+		t.Fatalf("expected generic project summary to be rejected")
+	}
+}
+
+func TestLowDetailSearchReasonAcceptsRepoEvidence(t *testing.T) {
+	answer := "1. OpenAI/codex - https://github.com/openai/codex - 终端编码代理。\n2. astral-sh/uv - https://github.com/astral-sh/uv - Python 包管理工具。"
+	if reason := lowDetailSearchReason("github 好玩的开源项目", answer); reason != "" {
+		t.Fatalf("expected repo evidence to pass, got: %s", reason)
+	}
+}
