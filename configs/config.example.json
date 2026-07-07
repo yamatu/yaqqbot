@@ -2,7 +2,10 @@
   // 如果你的 NapCat/OneBot 反向 WebSocket 需要 token，在这里填写；不需要可留空。
   "token": "请填写你的 TOKEN（如需）",
 
-  // 管理员 QQ 号白名单。私聊 bot、/nginx 管理等管理员能力只允许这些 QQ 使用。
+  // WebSocket 监听地址。只改端口可写成 "0.0.0.0:8765"。
+  "ws_listen_addr": "0.0.0.0:8765",
+
+  // 管理员 QQ 号白名单。私聊 bot、管理命令等管理员能力只允许这些 QQ 使用。
   // 也可以用环境变量 ADMIN_QQ_USERS="984346643,836644146" 覆盖。
   "admin_qq_users": ["984346643", "836644146", "3541975032"],
 
@@ -19,6 +22,7 @@
   "gpt_api_key": "YOUR_GPT_API_KEY",
   "gpt_api_base": "https://codex-api.packycode.com/v1",
   "gpt_model": "gpt-5.1",
+  "gpt_image_model": "gpt-image-2",
 
   "grok_api_key": "YOUR_GROK_API_KEY",
   "grok_api_base": "https://happyapi.org/v1",
@@ -28,7 +32,7 @@
   "deepseek_api_base": "https://api.deepseek.com",
   "deepseek_model": "deepseek-v4-flash",
 
-  // Gemini 图片生成。/img 支持写尺寸：/img 1024x768 一只猫。
+  // /img 默认使用 GPT 图片生成；/gimg 保留 Gemini 图片生成。二者都支持写尺寸。
   "gemini_api_key": "YOUR_GEMINI_API_KEY",
   "gemini_api_base": "https://generativelanguage.googleapis.com/v1beta",
   "gemini_image_model": "gemini-2.5-flash-image",
@@ -52,9 +56,14 @@
   // B 站视频解析接口；失败时会回退到网页爬取。
   "bilibili_api_base": "https://api.bilibili.com/x/web-interface/view",
 
+  // SearXNG 搜索 API 地址。配置后所有 AI 对话都会自动附加联网搜索摘要，也可用 /search 和 /news。
+  // 你的 SearXNG 实例需要开启 JSON 格式输出。
+  "searxng_api_base": "https://你的-searxng.example.com",
+
   "packycode_userinfo_url": "https://codex.packycode.com/api/backend/users/info",
   "packycode_user_jwt": "你的 JWT（如需）",
 
-  // 支持 http(s) 代理；socks5 会退化为直连，除非后续替换为 socks transport。
-  "socks5_proxy": "socks5://127.0.0.1:41457"
+  // 支持 http(s) 与 socks5 代理。/socks on|off 可在 QQ 内动态开关外部请求是否走代理。
+  "socks5_proxy": "socks5://127.0.0.1:41457",
+  "proxy_enabled": false
 }

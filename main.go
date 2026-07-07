@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"unicode"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/proxy"
 
 	"qq_client/internal/codexcli"
 	"qq_client/internal/openaiutil"
@@ -42,18 +44,13 @@ import (
 
 const (
 	// 持久化文件
-	memoryFile         = "user_memory.json"
-	groupSettingsKey   = "__group_settings__"
-	nginxServersFile   = "nginx_servers.json"
-	steamWatchFile     = "steam_watch.json"
-	messageChunkSize   = 4000
-	nginxStreamConfDir = "/etc/nginx/stream.conf.d"
+	memoryFile       = "user_memory.json"
+	groupSettingsKey = "__group_settings__"
+	steamWatchFile   = "steam_watch.json"
+	messageChunkSize = 4000
 
 	// 配置文件路径
 	configFilePath = "configs/config.json"
-
-	// WebSocket 监听地址
-	wsListenAddr = "0.0.0.0:8765"
 )
 
 // QQ 私聊白名单
@@ -71,8 +68,9 @@ var (
 	gptAPIKey = os.Getenv("GPT_API_KEY")
 	// OpenAI 官方接口通常为 https://api.openai.com/v1
 	// 注意：不要填写成 https://api.openai.com/v1/codex（这是 Codex CLI 专用前缀）
-	gptAPIBase = envOrDefault("GPT_API_BASE", "https://api.openai.com/v1")
-	gptModel   = envOrDefault("GPT_MODEL", "gpt-5.1")
+	gptAPIBase    = envOrDefault("GPT_API_BASE", "https://api.openai.com/v1")
+	gptModel      = envOrDefault("GPT_MODEL", "gpt-5.1")
+	gptImageModel = envOrDefault("GPT_IMAGE_MODEL", "gpt-image-2")
 
 	grokAPIKey  = os.Getenv("GROK_API_KEY")
 	grokAPIBase = envOrDefault("GROK_API_BASE", "https://happyapi.org/v1")
@@ -94,12 +92,15 @@ var (
 	steamPollInterval    = envDurationOrDefault("STEAM_POLL_INTERVAL", 60*time.Second)
 	longForwardThreshold = envIntOrDefault("LONG_FORWARD_THRESHOLD", 3000)
 	maxContextChars      = envIntOrDefault("MAX_CONTEXT_CHARS", 24000)
+	wsListenAddr         = envOrDefault("WS_LISTEN_ADDR", "0.0.0.0:8765")
 
 	amapAPIKey      = os.Getenv("AMAP_API_KEY")
 	bilibiliAPIBase = envOrDefault("BILIBILI_API_BASE", "https://api.bilibili.com/x/web-interface/view")
+	searxngAPIBase  = envOrDefault("SEARXNG_API_BASE", "")
 
 	// SOCKS5/HTTP 代理（例如 socks5://127.0.0.1:41457 或 http://127.0.0.1:1080）
-	socks5Proxy = os.Getenv("SOCKS5_PROXY")
+	socks5Proxy  = os.Getenv("SOCKS5_PROXY")
+	proxyEnabled = envBoolOrDefault("PROXY_ENABLED", false)
 )
 
 // 提示词文件
@@ -140,13 +141,6 @@ type groupSettings struct {
 type memorySnapshot struct {
 	Users         map[string]*userProfile
 	GroupSettings groupSettings
-}
-
-type nginxConfigFile struct {
-	Default string              `json:"__default__"`
-	Conf    map[string]string   `json:"__conf__"`
-	ACL     map[string][]string `json:"__acl__"`
-	Servers map[string]string   `json:"-"` // 其余顶层键为服务器 name->addr
 }
 
 // QQ 消息载体（只保留本项目用到的字段）
@@ -282,13 +276,6 @@ type qqBotServer struct {
 	modelPrompts  map[string]string
 	defaultModel  string
 
-	// Nginx 被控服务器
-	nginxMu          sync.RWMutex
-	nginxServers     map[string]string // name -> host:port
-	nginxDefault     string            // 当前默认服务器名（为空表示本机）
-	nginxServerConfs map[string]string // name -> conf filename
-	nginxACL         map[string][]string
-
 	// Steam 监控与已连接 OneBot 客户端
 	steamMu    sync.RWMutex
 	steamWatch map[string]*steamWatchEntry
@@ -298,6 +285,8 @@ type qqBotServer struct {
 	// HTTP 客户端
 	httpClient  *http.Client
 	proxyClient *http.Client
+	proxyMu     sync.RWMutex
+	proxyOn     bool
 
 	// 正则
 	reCQ            *regexp.Regexp
@@ -459,6 +448,7 @@ type fileConfig struct {
 	GPTAPIKey            string    `json:"gpt_api_key"`
 	GPTAPIBase           string    `json:"gpt_api_base"`
 	GPTModel             string    `json:"gpt_model"`
+	GPTImageModel        string    `json:"gpt_image_model"`
 	GrokAPIKey           string    `json:"grok_api_key"`
 	GrokAPIBase          string    `json:"grok_api_base"`
 	GrokModel            string    `json:"grok_model"`
@@ -475,9 +465,12 @@ type fileConfig struct {
 	SteamPollInterval    string    `json:"steam_poll_interval"`
 	LongForwardThreshold int       `json:"long_forward_threshold"`
 	MaxContextChars      int       `json:"max_context_chars"`
+	WSListenAddr         string    `json:"ws_listen_addr"`
 	AMapAPIKey           string    `json:"amap_api_key"`
 	BilibiliAPIBase      string    `json:"bilibili_api_base"`
+	SearxngAPIBase       string    `json:"searxng_api_base"`
 	Socks5Proxy          string    `json:"socks5_proxy"`
+	ProxyEnabled         *bool     `json:"proxy_enabled"`
 }
 
 // loadConfigFromFile 从 JSON 配置文件加载配置，并覆盖默认的环境变量值。
@@ -520,6 +513,9 @@ func loadConfigFromFile(path string) {
 	}
 	if cfg.GPTModel != "" {
 		gptModel = cfg.GPTModel
+	}
+	if cfg.GPTImageModel != "" {
+		gptImageModel = cfg.GPTImageModel
 	}
 	if cfg.GrokAPIKey != "" {
 		grokAPIKey = cfg.GrokAPIKey
@@ -573,14 +569,23 @@ func loadConfigFromFile(path string) {
 	if cfg.MaxContextChars > 0 {
 		maxContextChars = cfg.MaxContextChars
 	}
+	if cfg.WSListenAddr != "" {
+		wsListenAddr = cfg.WSListenAddr
+	}
 	if cfg.AMapAPIKey != "" {
 		amapAPIKey = cfg.AMapAPIKey
 	}
 	if cfg.BilibiliAPIBase != "" {
 		bilibiliAPIBase = cfg.BilibiliAPIBase
 	}
+	if cfg.SearxngAPIBase != "" {
+		searxngAPIBase = cfg.SearxngAPIBase
+	}
 	if cfg.Socks5Proxy != "" {
 		socks5Proxy = cfg.Socks5Proxy
+	}
+	if cfg.ProxyEnabled != nil {
+		proxyEnabled = *cfg.ProxyEnabled
 	}
 }
 
@@ -614,33 +619,73 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-// 目前 proxyClient 仅支持 HTTP/HTTPS 代理；如果 socks5Proxy 是 socks5:// 开头，会忽略代理设置。
 func newProxyHTTPClient() *http.Client {
 	if socks5Proxy == "" {
 		return newHTTPClient()
 	}
 	u, err := url.Parse(socks5Proxy)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		// 非 HTTP 代理暂不支持，退化为普通客户端
+	if err != nil {
 		return newHTTPClient()
 	}
+	dialer := (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: false,
+	})
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(u),
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			DualStack: false,
-		}).DialContext,
+		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(u)
+	case "socks5", "socks5h":
+		d, err := proxy.FromURL(u, proxy.Direct)
+		if err != nil {
+			return newHTTPClient()
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			type ctxDialer interface {
+				DialContext(context.Context, string, string) (net.Conn, error)
+			}
+			if cd, ok := d.(ctxDialer); ok {
+				return cd.DialContext(ctx, network, addr)
+			}
+			return d.Dial(network, addr)
+		}
+	default:
+		return newHTTPClient()
+	}
 	return &http.Client{
 		Transport: transport,
 		Timeout:   60 * time.Second,
 	}
+}
+
+func (b *qqBotServer) externalHTTPClient() *http.Client {
+	b.proxyMu.RLock()
+	useProxy := b.proxyOn
+	b.proxyMu.RUnlock()
+	if useProxy && strings.TrimSpace(socks5Proxy) != "" && b.proxyClient != nil {
+		return b.proxyClient
+	}
+	return b.httpClient
+}
+
+func (b *qqBotServer) setProxyEnabled(enabled bool) {
+	b.proxyMu.Lock()
+	defer b.proxyMu.Unlock()
+	b.proxyOn = enabled
+}
+
+func (b *qqBotServer) isProxyEnabled() bool {
+	b.proxyMu.RLock()
+	defer b.proxyMu.RUnlock()
+	return b.proxyOn
 }
 
 func newQQBotServer() *qqBotServer {
@@ -670,34 +715,31 @@ func newQQBotServer() *qqBotServer {
 	}
 
 	bot := &qqBotServer{
-		shutdown:         make(chan struct{}),
-		logger:           logger,
-		users:            make(map[string]*userProfile),
-		groupSettings:    groupSettings{BvEnabled: make(map[string]bool), ModelDefault: make(map[string]string)},
-		modelPrompts:     make(map[string]string),
-		defaultModel:     "gpt",
-		nginxServers:     make(map[string]string),
-		nginxServerConfs: make(map[string]string),
-		nginxACL:         make(map[string][]string),
-		steamWatch:       make(map[string]*steamWatchEntry),
-		clients:          make(map[*wsClient]struct{}),
-		httpClient:       newHTTPClient(),
-		proxyClient:      newProxyHTTPClient(),
-		reCQ:             reCQ,
-		reCQImage:        reCQImage,
-		reCQReply:        reCQReply,
-		reBV:             reBV,
-		reBilibiliURL:    reBilibiliURL,
-		reBilibiliShort:  reBilibiliShort,
-		reYouTube:        reYouTube,
-		reHostExtract:    reHost,
-		allowedUsers:     allowedUserSet,
-		allowedGroups:    allowedGroupSet,
+		shutdown:        make(chan struct{}),
+		logger:          logger,
+		users:           make(map[string]*userProfile),
+		groupSettings:   groupSettings{BvEnabled: make(map[string]bool), ModelDefault: make(map[string]string)},
+		modelPrompts:    make(map[string]string),
+		defaultModel:    "gpt",
+		steamWatch:      make(map[string]*steamWatchEntry),
+		clients:         make(map[*wsClient]struct{}),
+		httpClient:      newHTTPClient(),
+		proxyClient:     newProxyHTTPClient(),
+		proxyOn:         proxyEnabled,
+		reCQ:            reCQ,
+		reCQImage:       reCQImage,
+		reCQReply:       reCQReply,
+		reBV:            reBV,
+		reBilibiliURL:   reBilibiliURL,
+		reBilibiliShort: reBilibiliShort,
+		reYouTube:       reYouTube,
+		reHostExtract:   reHost,
+		allowedUsers:    allowedUserSet,
+		allowedGroups:   allowedGroupSet,
 	}
 
 	bot.loadMemory()
 	bot.loadModelPrompts()
-	bot.loadNginxServers()
 	bot.loadSteamWatch()
 	bot.startBackgroundSave()
 	bot.startSteamMonitor()
@@ -986,826 +1028,6 @@ func (b *qqBotServer) loadModelPrompts() {
 	}
 }
 
-// ============ Nginx 服务器配置 ============
-
-func (b *qqBotServer) loadNginxServers() {
-	b.nginxMu.Lock()
-	defer b.nginxMu.Unlock()
-
-	file, err := os.Open(nginxServersFile)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	var raw map[string]json.RawMessage
-	if err := json.NewDecoder(file).Decode(&raw); err != nil {
-		b.logger.Printf("加载被控服务器配置失败: %v", err)
-		return
-	}
-
-	var cfg nginxConfigFile
-	cfg.Conf = make(map[string]string)
-	cfg.ACL = make(map[string][]string)
-	cfg.Servers = make(map[string]string)
-
-	for k, v := range raw {
-		if k == "__default__" {
-			_ = json.Unmarshal(v, &cfg.Default)
-		} else if k == "__conf__" {
-			_ = json.Unmarshal(v, &cfg.Conf)
-		} else if k == "__acl__" {
-			_ = json.Unmarshal(v, &cfg.ACL)
-		} else {
-			var addr string
-			if err := json.Unmarshal(v, &addr); err == nil {
-				cfg.Servers[k] = addr
-			}
-		}
-	}
-
-	b.nginxDefault = cfg.Default
-	for k, v := range cfg.Conf {
-		b.nginxServerConfs[k] = v
-	}
-	for k, v := range cfg.ACL {
-		b.nginxACL[k] = v
-	}
-	for k, v := range cfg.Servers {
-		b.nginxServers[k] = v
-	}
-}
-
-func (b *qqBotServer) saveNginxServersLocked() {
-	data := make(map[string]any)
-	if b.nginxDefault != "" {
-		data["__default__"] = b.nginxDefault
-	}
-	if len(b.nginxServerConfs) > 0 {
-		data["__conf__"] = b.nginxServerConfs
-	}
-	if len(b.nginxACL) > 0 {
-		data["__acl__"] = b.nginxACL
-	}
-	for k, v := range b.nginxServers {
-		data[k] = v
-	}
-	tmp := nginxServersFile + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		b.logger.Printf("保存被控服务器配置失败（创建临时文件）: %v", err)
-		return
-	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(data); err != nil {
-		b.logger.Printf("保存被控服务器配置失败: %v", err)
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return
-	}
-	_ = f.Close()
-	if err := os.Rename(tmp, nginxServersFile); err != nil {
-		b.logger.Printf("保存被控服务器配置失败（重命名）: %v", err)
-	}
-}
-
-func (b *qqBotServer) isGlobalAdmin(userID string, msgType string) bool {
-	if msgType != "private" {
-		return false
-	}
-	_, ok := b.allowedUsers[userID]
-	return ok
-}
-
-// 返回 (name, host, port, ok)
-func (b *qqBotServer) getDefaultNginxServer() (string, string, int, bool) {
-	b.nginxMu.RLock()
-	defer b.nginxMu.RUnlock()
-	if len(b.nginxServers) == 0 {
-		return "", "", 0, false
-	}
-	name := b.nginxDefault
-	addr := ""
-	if name != "" {
-		if v, ok := b.nginxServers[name]; ok {
-			addr = v
-		}
-	}
-	if addr == "" {
-		for k, v := range b.nginxServers {
-			name = k
-			addr = v
-			break
-		}
-	}
-	if addr == "" {
-		return "", "", 0, false
-	}
-	host, portStr, ok := strings.Cut(addr, ":")
-	if !ok || host == "" {
-		return "", "", 0, false
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		return "", "", 0, false
-	}
-	return name, strings.TrimSpace(host), port, true
-}
-
-// ============ Nginx 本地操作 ============
-
-func (b *qqBotServer) runShellCommand(ctx context.Context, name string, args ...string) (int, string) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode(), strings.TrimSpace(string(out))
-		}
-		return 1, fmt.Sprintf("执行命令异常: %v, 输出: %s", err, strings.TrimSpace(string(out)))
-	}
-	return 0, strings.TrimSpace(string(out))
-}
-
-func (b *qqBotServer) reloadNginx(ctx context.Context) (bool, string) {
-	code, output := b.runShellCommand(ctx, "nginx", "-t")
-	if code != 0 {
-		return false, "❌ nginx 配置测试失败 (nginx -t)\n" + output
-	}
-	type tryCmd struct {
-		Name string
-		Args []string
-	}
-	cmds := []tryCmd{
-		{"nginx", []string{"-s", "reload"}},
-		{"systemctl", []string{"reload", "nginx"}},
-		{"systemctl", []string{"restart", "nginx"}},
-	}
-	var tried []string
-	for _, c := range cmds {
-		code, out := b.runShellCommand(ctx, c.Name, c.Args...)
-		tried = append(tried, fmt.Sprintf("- %s %s (exit %d)\n  输出: %s", c.Name, strings.Join(c.Args, " "), code, out))
-		if code == 0 {
-			return true, fmt.Sprintf("✅ 已执行: %s %s\n%s", c.Name, strings.Join(c.Args, " "), out)
-		}
-	}
-	return false, "❌ 所有 Nginx 重载命令均执行失败，已保留配置文件，请手动检查：\n" + strings.Join(tried, "\n")
-}
-
-func (b *qqBotServer) nginxTestConfig(ctx context.Context) string {
-	code, output := b.runShellCommand(ctx, "nginx", "-t")
-	if code == 0 {
-		return "✅ nginx 配置语法检测通过 (nginx -t)\n" + output
-	}
-	return "❌ nginx 配置语法检测失败 (nginx -t)\n" + output
-}
-
-// 解析 stream 配置文件，输出概要。
-func parseNginxStreamSummary(content, filename string) []string {
-	results := []string{}
-	metaRe := regexp.MustCompile(`^#\s*name=(?P<name>\S+)\s+target=(?P<host>[^:\s]+):(?P<tport>\d+)\s+listen=(?P<lport>\d+)`)
-	for _, m := range metaRe.FindAllStringSubmatch(content, -1) {
-		if len(m) < 5 {
-			continue
-		}
-		name := m[1]
-		host := m[2]
-		tport := m[3]
-		lport := m[4]
-		results = append(results, fmt.Sprintf("%s: %s:%s -> 0.0.0.0:%s", name, host, tport, lport))
-	}
-	// upstream + server 推导
-	upMap := map[string][2]string{}
-	upRe := regexp.MustCompile(`upstream\s+([a-zA-Z0-9_-]+)\s*{([^}]*)}`)
-	serverRe := regexp.MustCompile(`server\s+([0-9a-zA-Z\.\-]+):(\d+);`)
-	for _, m := range upRe.FindAllStringSubmatch(content, -1) {
-		if len(m) < 3 {
-			continue
-		}
-		upName := m[1]
-		body := m[2]
-		if s := serverRe.FindStringSubmatch(body); len(s) >= 3 {
-			upMap[upName] = [2]string{s[1], s[2]}
-		}
-	}
-	serverBlockRe := regexp.MustCompile(`server\s*{([^}]*)}`)
-	proxyPassRe := regexp.MustCompile(`proxy_pass\s+([a-zA-Z0-9_-]+);`)
-	listenRe := regexp.MustCompile(`listen\s+(?:[0-9\.\:]+\:)?(\d+)\b`)
-	seen := map[string]struct{}{}
-	for _, m := range serverBlockRe.FindAllStringSubmatch(content, -1) {
-		if len(m) < 2 {
-			continue
-		}
-		body := m[1]
-		p := proxyPassRe.FindStringSubmatch(body)
-		if len(p) < 2 {
-			continue
-		}
-		upName := p[1]
-		up, ok := upMap[upName]
-		if !ok {
-			continue
-		}
-		lp := listenRe.FindStringSubmatch(body)
-		if len(lp) < 2 {
-			continue
-		}
-		lport := lp[1]
-		host := up[0]
-		tport := up[1]
-		key := fmt.Sprintf("%s|%s|%s|%s", upName, host, tport, lport)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		results = append(results, fmt.Sprintf("%s: %s:%s -> 0.0.0.0:%s", upName, host, tport, lport))
-	}
-	if len(results) == 0 {
-		return []string{fmt.Sprintf("%s (自定义配置，未解析详细信息)", filename)}
-	}
-	return results
-}
-
-func (b *qqBotServer) nginxListConfigs() string {
-	if fi, err := os.Stat(nginxStreamConfDir); err != nil || !fi.IsDir() {
-		return fmt.Sprintf("❌ 目录不存在: %s\n请确认已在 nginx.conf 中正确配置 include。", nginxStreamConfDir)
-	}
-	entries, err := os.ReadDir(nginxStreamConfDir)
-	if err != nil {
-		return fmt.Sprintf("❌ 读取目录失败: %v", err)
-	}
-	var files []string
-	for _, e := range entries {
-		if !e.Type().IsRegular() {
-			continue
-		}
-		if strings.HasSuffix(e.Name(), ".conf") {
-			files = append(files, e.Name())
-		}
-	}
-	if len(files) == 0 {
-		return "📂 当前没有任何 stream 配置 (.conf)。"
-	}
-	lines := []string{"📂 Nginx stream 配置列表:"}
-	for _, fn := range files {
-		path := filepath.Join(nginxStreamConfDir, fn)
-		content, err := os.ReadFile(path)
-		if err != nil {
-			lines = append(lines, fmt.Sprintf("- %s: 读取失败: %v", fn, err))
-			continue
-		}
-		for _, s := range parseNginxStreamSummary(string(content), fn) {
-			lines = append(lines, fmt.Sprintf("- %s  [%s]", s, fn))
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (b *qqBotServer) nginxAddConfig(ctx context.Context, name, targetHost, targetPort, listenPort string) string {
-	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(name) {
-		return "❌ 名字只允许使用字母、数字、下划线、短横线。"
-	}
-	if strings.Contains(targetHost, " ") || strings.Contains(targetHost, "/") {
-		return "❌ 转发地址格式不合法，只允许域名或 IP，不要包含协议/http://。"
-	}
-	tPort, err1 := strconv.Atoi(targetPort)
-	lPort, err2 := strconv.Atoi(listenPort)
-	if err1 != nil || err2 != nil {
-		return "❌ 端口号必须是数字。"
-	}
-	if tPort < 1 || tPort > 65535 || lPort < 1 || lPort > 65535 {
-		return "❌ 端口号必须在 1-65535 之间。"
-	}
-	if err := os.MkdirAll(nginxStreamConfDir, 0o755); err != nil {
-		return fmt.Sprintf("❌ 创建目录失败: %v", err)
-	}
-	confPath := filepath.Join(nginxStreamConfDir, name+".conf")
-	backupMsg := ""
-	if _, err := os.Stat(confPath); err == nil {
-		ts := time.Now().Format("20060102150405")
-		backupPath := confPath + ".bak." + ts
-		if err := copyFile(confPath, backupPath); err != nil {
-			backupMsg = fmt.Sprintf("\n⚠️ 旧配置备份失败: %v", err)
-		} else {
-			backupMsg = "\nℹ️ 已备份旧配置为: " + backupPath
-		}
-	}
-	content := fmt.Sprintf(`# name=%s target=%s:%d listen=%d  auto=qqbot
-stream {
-    resolver 1.1.1.1 valid=300s ipv6=on;
-
-    upstream %s {
-        server %s:%d;
-    }
-
-    # 支持 TCP 协议
-    server {
-        listen 0.0.0.0:%d;
-        proxy_connect_timeout 5s;
-        proxy_timeout 600s;
-        proxy_pass %s;
-    }
-
-    # 支持 UDP 协议
-    server {
-        listen 0.0.0.0:%d udp;
-        proxy_connect_timeout 5s;
-        proxy_timeout 600s;
-        proxy_pass %s;
-    }
-}
-`, name, targetHost, tPort, lPort, name, targetHost, tPort, lPort, name, lPort, name)
-	if err := os.WriteFile(confPath, []byte(content), 0o644); err != nil {
-		if os.IsPermission(err) {
-			return fmt.Sprintf("❌ 写入失败，没有权限写入 %s，请确保机器人进程具有 root 权限。", confPath)
-		}
-		return fmt.Sprintf("❌ 写入配置失败: %v", err)
-	}
-	ok, reloadMsg := b.reloadNginx(ctx)
-	prefix := fmt.Sprintf("✅ 已写入配置: %s%s\n", confPath, backupMsg)
-	if ok {
-		return prefix + reloadMsg
-	}
-	return prefix + reloadMsg
-}
-
-func (b *qqBotServer) nginxRemoveConfig(ctx context.Context, name string) string {
-	confPath := filepath.Join(nginxStreamConfDir, name+".conf")
-	if _, err := os.Stat(confPath); err != nil {
-		if os.IsNotExist(err) {
-			return "❌ 未找到配置文件: " + confPath
-		}
-		return fmt.Sprintf("❌ 访问配置文件失败: %v", err)
-	}
-	ts := time.Now().Format("20060102150405")
-	backupPath := confPath + ".bak." + ts
-	backupMsg := ""
-	if err := copyFile(confPath, backupPath); err != nil {
-		backupMsg = fmt.Sprintf("\n⚠️ 删除前备份失败: %v", err)
-	} else {
-		backupMsg = "\nℹ️ 已备份为: " + backupPath
-	}
-	if err := os.Remove(confPath); err != nil {
-		if os.IsPermission(err) {
-			return fmt.Sprintf("❌ 删除失败，没有权限删除 %s，请确保机器人进程具有 root 权限。", confPath)
-		}
-		return fmt.Sprintf("❌ 删除配置失败: %v", err)
-	}
-	ok, reloadMsg := b.reloadNginx(ctx)
-	prefix := fmt.Sprintf("✅ 已删除配置: %s%s\n", confPath, backupMsg)
-	if ok {
-		return prefix + reloadMsg
-	}
-	return prefix + reloadMsg
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Sync()
-}
-
-// ============ 远程 NginxAgent 调用 ============
-
-func (b *qqBotServer) callRemoteNginx(ctx context.Context, serverName, host string, port int, cmd string, params map[string]any) (bool, string) {
-	u := fmt.Sprintf("ws://%s:%d", host, port)
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 5 * time.Second,
-	}
-	conn, _, err := dialer.DialContext(ctx, u, nil)
-	if err != nil {
-		return false, fmt.Sprintf("⚠️ 无法连接到被控服务器 %s (%s): %v", serverName, u, err)
-	}
-	defer conn.Close()
-
-	payload := map[string]any{
-		"type":   "nginx_cmd",
-		"cmd":    cmd,
-		"params": params,
-	}
-	if err := conn.WriteJSON(payload); err != nil {
-		return false, fmt.Sprintf("⚠️ 已连接 %s，但发送 %s 指令失败: %v", u, cmd, err)
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	_, msg, err := conn.ReadMessage()
-	if err != nil {
-		return false, fmt.Sprintf("⚠️ 已连接 %s，但接收 %s 返回失败: %v", u, cmd, err)
-	}
-	var resp struct {
-		Type    string `json:"type"`
-		OK      bool   `json:"ok"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(msg, &resp); err != nil {
-		return false, fmt.Sprintf("⚠️ 来自 %s (%s) 的返回不是合法 JSON。", serverName, u)
-	}
-	if resp.Type != "nginx_result" {
-		return false, fmt.Sprintf("⚠️ 来自 %s (%s) 的返回类型异常: %s", serverName, u, resp.Type)
-	}
-	prefix := fmt.Sprintf("🎯 目标服务器: %s (%s)\n", serverName, u)
-	return resp.OK, prefix + resp.Message
-}
-
-func (b *qqBotServer) testRemoteNginxServer(ctx context.Context, name, host string, port int) (bool, string) {
-	return b.callRemoteNginx(ctx, name, host, port, "test", map[string]any{})
-}
-
-// ============ Nginx 指令处理 ============
-
-func (b *qqBotServer) handleNginxServerCommand(parts []string, userID, msgType string) string {
-	if !b.isGlobalAdmin(userID, msgType) {
-		return "❌ 只有白名单私聊管理员可以管理被控服务器。"
-	}
-	if len(parts) == 0 {
-		return "🌐 Nginx 被控服务器管理:\n" +
-			"/nginx server list                 查看所有被控服务器\n" +
-			"/nginx server add 名字 地址:端口   新增/更新被控服务器\n" +
-			"  例如: /nginx server add s1 1.2.3.4:9876\n" +
-			"/nginx server rm 名字              删除被控服务器"
-	}
-	action := strings.ToLower(parts[0])
-
-	b.nginxMu.Lock()
-	defer b.nginxMu.Unlock()
-
-	switch action {
-	case "list":
-		if len(b.nginxServers) == 0 {
-			return "📂 当前没有配置任何被控服务器。"
-		}
-		lines := []string{"📂 被控服务器列表:"}
-		for name, addr := range b.nginxServers {
-			lines = append(lines, fmt.Sprintf("- %s: %s", name, addr))
-		}
-		return strings.Join(lines, "\n")
-	case "add":
-		if len(parts) != 3 {
-			return "❌ 用法错误: /nginx server add [名字] [地址]:[端口]\n" +
-				"示例: /nginx server add s1 1.2.3.4:9876"
-		}
-		name := parts[1]
-		addr := parts[2]
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(name) {
-			return "❌ 名字只允许使用字母、数字、下划线、短横线。"
-		}
-		host, portStr, ok := strings.Cut(addr, ":")
-		if !ok {
-			return "❌ 地址格式错误，应为 [主机]:[端口]，例如 1.2.3.4:9876 或 agent.example.com:9876"
-		}
-		host = strings.TrimSpace(host)
-		if host == "" {
-			return "❌ 主机名不能为空。"
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil || port < 1 || port > 65535 {
-			return "❌ 端口必须在 1-65535 之间。"
-		}
-		value := fmt.Sprintf("%s:%d", host, port)
-		b.nginxServers[name] = value
-		if b.nginxDefault == "" {
-			b.nginxDefault = name
-		}
-		b.saveNginxServersLocked()
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		ok2, testMsg := b.testRemoteNginxServer(ctx, name, host, port)
-		_ = ok2
-		return fmt.Sprintf("✅ 已添加/更新被控服务器: %s -> %s\n%s", name, value, testMsg)
-	case "rm":
-		if len(parts) != 2 {
-			return "❌ 用法错误: /nginx server rm [名字]"
-		}
-		name := parts[1]
-		if _, ok := b.nginxServers[name]; !ok {
-			return fmt.Sprintf("❌ 未找到被控服务器: %s", name)
-		}
-		delete(b.nginxServers, name)
-		if b.nginxDefault == name {
-			b.nginxDefault = ""
-		}
-		delete(b.nginxServerConfs, name)
-		delete(b.nginxACL, name)
-		b.saveNginxServersLocked()
-		return fmt.Sprintf("✅ 已删除被控服务器: %s", name)
-	default:
-		return "❌ 未知 server 子命令: " + action + "\n" +
-			"可用子命令: list / add / rm\n" +
-			"示例: /nginx server add s1 1.2.3.4:9876"
-	}
-}
-
-func (b *qqBotServer) handleNginxQQCommand(parts []string, userID, msgType string) string {
-	if !b.isGlobalAdmin(userID, msgType) {
-		return "❌ 只有白名单私聊管理员可以管理 Nginx QQ 权限。"
-	}
-	if len(parts) == 0 {
-		return "🔐 Nginx QQ 权限管理:\n" +
-			"/nginx qq add 服务器名 QQ   添加某 QQ 为该服务器编辑者\n" +
-			"/nginx qq rm 服务器名 QQ    删除某 QQ 的编辑权限\n" +
-			"/nginx qq list [服务器名]   查看某服务器的授权列表"
-	}
-	action := strings.ToLower(parts[0])
-
-	b.nginxMu.Lock()
-	defer b.nginxMu.Unlock()
-
-	switch action {
-	case "add", "addr":
-		if len(parts) != 3 {
-			return "❌ 用法错误: /nginx qq add [服务器名] [QQ号]"
-		}
-		sName := parts[1]
-		qq := parts[2]
-		if _, ok := b.nginxServers[sName]; !ok {
-			return fmt.Sprintf("❌ 未找到被控服务器: %s", sName)
-		}
-		acl := b.nginxACL[sName]
-		for _, id := range acl {
-			if id == qq {
-				return fmt.Sprintf("✅ 已为服务器 %s 授权 QQ: %s\n当前授权用户: %s", sName, qq, strings.Join(acl, ", "))
-			}
-		}
-		acl = append(acl, qq)
-		b.nginxACL[sName] = acl
-		b.saveNginxServersLocked()
-		return fmt.Sprintf("✅ 已为服务器 %s 授权 QQ: %s\n当前授权用户: %s", sName, qq, strings.Join(acl, ", "))
-	case "rm":
-		if len(parts) != 3 {
-			return "❌ 用法错误: /nginx qq rm [服务器名] [QQ号]"
-		}
-		sName := parts[1]
-		qq := parts[2]
-		if _, ok := b.nginxServers[sName]; !ok {
-			return fmt.Sprintf("❌ 未找到被控服务器: %s", sName)
-		}
-		acl := b.nginxACL[sName]
-		newACL := make([]string, 0, len(acl))
-		found := false
-		for _, id := range acl {
-			if id == qq {
-				found = true
-				continue
-			}
-			newACL = append(newACL, id)
-		}
-		if !found {
-			return fmt.Sprintf("ℹ️ QQ %s 本来就没有 %s 的编辑权限。", qq, sName)
-		}
-		if len(newACL) == 0 {
-			delete(b.nginxACL, sName)
-		} else {
-			b.nginxACL[sName] = newACL
-		}
-		b.saveNginxServersLocked()
-		return fmt.Sprintf("✅ 已从服务器 %s 移除 QQ 授权: %s", sName, qq)
-	case "list":
-		if len(parts) == 1 {
-			if len(b.nginxACL) == 0 {
-				return "📂 当前没有为任何服务器配置 QQ 权限。"
-			}
-			lines := []string{"📂 Nginx QQ 权限列表:"}
-			for sName, acl := range b.nginxACL {
-				val := "无"
-				if len(acl) > 0 {
-					val = strings.Join(acl, ", ")
-				}
-				lines = append(lines, fmt.Sprintf("- %s: %s", sName, val))
-			}
-			return strings.Join(lines, "\n")
-		}
-		if len(parts) == 2 {
-			sName := parts[1]
-			if _, ok := b.nginxServers[sName]; !ok {
-				return fmt.Sprintf("❌ 未找到被控服务器: %s", sName)
-			}
-			acl := b.nginxACL[sName]
-			val := "无"
-			if len(acl) > 0 {
-				val = strings.Join(acl, ", ")
-			}
-			return fmt.Sprintf("📂 服务器 %s 授权 QQ 列表:\n%s", sName, val)
-		}
-		return "❌ 用法错误: /nginx qq list [服务器名]"
-	default:
-		return "❌ 未知 qq 子命令: " + action + "\n可用子命令: add / rm / list"
-	}
-}
-
-func (b *qqBotServer) handleNginxCommand(rawArgs, userID, msgType string) string {
-	args := strings.TrimSpace(rawArgs)
-	name, host, port, hasDefault := b.getDefaultNginxServer()
-	isAdmin := b.isGlobalAdmin(userID, msgType)
-
-	if args == "" {
-		return "🌐 Nginx 管理用法:\n" +
-			"/nginx list                查看当前所有 stream 配置\n" +
-			"/nginx add 名字 地址 远端端口 本地端口\n" +
-			"  例如: /nginx add jpp jpp.yamatu.xyz 46569 10197\n" +
-			"/nginx rm 名字            删除指定名字的配置\n" +
-			"/nginx -t                  仅测试 nginx 配置语法 (nginx -t)\n" +
-			"/nginx mkdir 文件名        在远程创建/选择配置文件\n" +
-			"/nginx set 服务器名|local  切换默认被控服务器\n" +
-			"/nginx server ...          管理被控服务器 (list/add/rm)"
-	}
-	parts := strings.Fields(args)
-	sub := strings.ToLower(parts[0])
-
-	if sub == "-h" || sub == "--help" || sub == "help" {
-		return "🌐 Nginx 管理用法:\n" +
-			"/nginx list                查看当前所有 stream 配置\n" +
-			"/nginx add 名字 地址 远端端口 本地端口\n" +
-			"  示例: /nginx add jpp jpp.yamatu.xyz 46569 10197\n" +
-			"/nginx rm 名字            删除指定名字的配置\n" +
-			"/nginx -t                  测试 nginx 配置语法 (nginx -t)\n" +
-			"/nginx mkdir 文件名        在被控服务器上创建/选择配置文件\n" +
-			"  示例: /nginx mkdir forword\n" +
-			"/nginx set 服务器名|local  切换默认被控服务器\n" +
-			"  示例: /nginx set jpix\n" +
-			"/nginx qq add 服务器名 QQ  授权 QQ 编辑指定服务器配置\n" +
-			"/nginx qq rm 服务器名 QQ   撤销 QQ 的编辑权限\n" +
-			"/nginx server ...          管理被控服务器 (list/add/rm)\n" +
-			"  示例: /nginx server add jpix 1.2.3.4:10190"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	switch sub {
-	case "list":
-		if hasDefault {
-			ok, msg := b.callRemoteNginx(ctx, name, host, port, "list", map[string]any{})
-			_ = ok
-			return msg
-		}
-		return b.nginxListConfigs()
-	case "-t", "test", "check":
-		if hasDefault {
-			ok, msg := b.callRemoteNginx(ctx, name, host, port, "test", map[string]any{})
-			_ = ok
-			return msg
-		}
-		return b.nginxTestConfig(ctx)
-	case "mkdir":
-		if !hasDefault {
-			return "❌ 当前未配置任何被控服务器，请先使用 /nginx server add 添加。"
-		}
-		if len(parts) != 2 {
-			return "❌ 用法错误: /nginx mkdir [文件名]"
-		}
-		confName := parts[1]
-		// 权限检查
-		b.nginxMu.RLock()
-		if !isAdmin {
-			acl := b.nginxACL[name]
-			allowed := false
-			for _, id := range acl {
-				if id == userID {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				b.nginxMu.RUnlock()
-				return fmt.Sprintf("❌ 你没有权限修改服务器 %s 的配置，请联系管理员使用 /nginx qq add 授权。", name)
-			}
-		}
-		b.nginxMu.RUnlock()
-
-		b.nginxMu.Lock()
-		b.nginxServerConfs[name] = confName
-		b.saveNginxServersLocked()
-		b.nginxMu.Unlock()
-
-		ok, msg := b.callRemoteNginx(ctx, name, host, port, "mkdir", map[string]any{"conf": confName})
-		_ = ok
-		return msg
-	case "set":
-		if !isAdmin {
-			return "❌ 只有白名单私聊管理员可以使用 /nginx set 切换默认服务器。"
-		}
-		if len(parts) != 2 {
-			return "❌ 用法错误: /nginx set [服务器名|local]"
-		}
-		target := parts[1]
-		b.nginxMu.Lock()
-		defer b.nginxMu.Unlock()
-		if strings.EqualFold(target, "local") {
-			b.nginxDefault = ""
-			b.saveNginxServersLocked()
-			return "✅ 已切换到本机 Nginx，不再使用远程被控服务器。"
-		}
-		if _, ok := b.nginxServers[target]; !ok {
-			return fmt.Sprintf("❌ 未找到被控服务器: %s", target)
-		}
-		b.nginxDefault = target
-		b.saveNginxServersLocked()
-		addr := b.nginxServers[target]
-		confName := b.nginxServerConfs[target]
-		extra := "，尚未选择配置文件，请先 /nginx mkdir [文件名]"
-		if confName != "" {
-			extra = "，当前配置文件: " + confName + ".conf"
-		}
-		return fmt.Sprintf("✅ 默认被控服务器已切换为: %s -> %s%s", target, addr, extra)
-	case "server":
-		return b.handleNginxServerCommand(parts[1:], userID, msgType)
-	case "qq":
-		return b.handleNginxQQCommand(parts[1:], userID, msgType)
-	case "add":
-		if len(parts) != 5 {
-			return "❌ 用法错误: /nginx add [名字] [转发地址] [目标端口] [本地端口]\n" +
-				"示例: /nginx add jpp jpp.yamatu.xyz 46569 10197"
-		}
-		nameArg := parts[1]
-		hostArg := parts[2]
-		tPort := parts[3]
-		lPort := parts[4]
-		if hasDefault {
-			// 权限检查
-			b.nginxMu.RLock()
-			if !isAdmin {
-				acl := b.nginxACL[name]
-				allowed := false
-				for _, id := range acl {
-					if id == userID {
-						allowed = true
-						break
-					}
-				}
-				if !allowed {
-					b.nginxMu.RUnlock()
-					return fmt.Sprintf("❌ 你没有权限修改服务器 %s 的配置，请联系管理员使用 /nginx qq add 授权。", name)
-				}
-			}
-			confName := b.nginxServerConfs[name]
-			b.nginxMu.RUnlock()
-			if confName == "" {
-				return fmt.Sprintf("❌ 当前默认服务器 %s 尚未选择配置文件，请先使用 /nginx mkdir [文件名]", name)
-			}
-			params := map[string]any{
-				"conf":        confName,
-				"name":        nameArg,
-				"target_host": hostArg,
-				"target_port": tPort,
-				"listen_port": lPort,
-			}
-			ok, msg := b.callRemoteNginx(ctx, name, host, port, "add", params)
-			_ = ok
-			return msg
-		}
-		return b.nginxAddConfig(ctx, nameArg, hostArg, tPort, lPort)
-	case "rm":
-		if len(parts) != 2 {
-			return "❌ 用法错误: /nginx rm [名字]"
-		}
-		nameArg := parts[1]
-		if hasDefault {
-			b.nginxMu.RLock()
-			if !isAdmin {
-				acl := b.nginxACL[name]
-				allowed := false
-				for _, id := range acl {
-					if id == userID {
-						allowed = true
-						break
-					}
-				}
-				if !allowed {
-					b.nginxMu.RUnlock()
-					return fmt.Sprintf("❌ 你没有权限修改服务器 %s 的配置，请联系管理员使用 /nginx qq add 授权。", name)
-				}
-			}
-			confName := b.nginxServerConfs[name]
-			b.nginxMu.RUnlock()
-			if confName == "" {
-				return fmt.Sprintf("❌ 当前默认服务器 %s 尚未选择配置文件，请先使用 /nginx mkdir [文件名]", name)
-			}
-			params := map[string]any{
-				"conf": confName,
-				"name": nameArg,
-			}
-			ok, msg := b.callRemoteNginx(ctx, name, host, port, "rm", params)
-			_ = ok
-			return msg
-		}
-		return b.nginxRemoveConfig(ctx, nameArg)
-	default:
-		return fmt.Sprintf("❌ 未知子命令: %s\n可用子命令: list / add / rm / -t / server\n示例: /nginx add jpp jpp.yamatu.xyz 46569 10197\n      /nginx -t\n      /nginx server list", sub)
-	}
-}
-
 // ============ 业务 API：Ping / 天气 / Epic / B站 / YouTube ============
 
 func (b *qqBotServer) pingViaProxy(rawInput string) string {
@@ -1818,31 +1040,31 @@ func (b *qqBotServer) pingViaProxy(rawInput string) string {
 		return "❌ 无法解析域名: " + rawInput
 	}
 	host := m[1]
-	targetURL := "https://" + host
-	start := time.Now()
-	client := b.proxyClient
-	if client == nil {
-		client = b.httpClient
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	args := []string{"-c", "4", host}
+	if runtime.GOOS == "windows" {
+		args = []string{"-n", "4", host}
 	}
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	out, err := exec.CommandContext(ctx, "ping", args...).CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		text = errString(err)
+	}
 	if err != nil {
-		return fmt.Sprintf("❌ Proxy Ping 失败\n🎯 目标: %s\n⚠️ 错误: %v", host, err)
+		return fmt.Sprintf("❌ 本地 Ping 失败\n🎯 目标: %s\n%s", host, text)
 	}
-	req = req.WithContext(context.Background())
-	resp, err := client.Do(req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Sprintf("❌ Proxy Ping 超时\n🎯 目标: %s\n⏳ 超过10s无响应", host)
-		}
-		return fmt.Sprintf("❌ Proxy Ping 失败\n🎯 目标: %s\n⚠️ 错误: %v", host, err)
+	if len(text) > 1800 {
+		text = text[:1800] + "\n...(已截断)"
 	}
-	defer resp.Body.Close()
-	latency := time.Since(start).Seconds() * 1000
-	icon := "✅"
-	if resp.StatusCode >= 400 {
-		icon = "⚠️"
+	return fmt.Sprintf("✅ 本地 Ping\n🎯 目标: %s\n%s", host, text)
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
 	}
-	return fmt.Sprintf("%s Proxy Ping\n🎯 目标: %s\n📶 延迟: %.2fms\n🔢 状态码: %d", icon, host, latency, resp.StatusCode)
+	return err.Error()
 }
 
 func (b *qqBotServer) getWeather(cityName string) string {
@@ -1862,7 +1084,7 @@ func (b *qqBotServer) getWeather(cityName string) string {
 	q1.Set("key", amapAPIKey)
 	q1.Set("address", cityName)
 	req1.URL.RawQuery = q1.Encode()
-	resp1, err := b.httpClient.Do(req1)
+	resp1, err := b.externalHTTPClient().Do(req1)
 	if err != nil {
 		return fmt.Sprintf("❌ API错误: %v", err)
 	}
@@ -1888,7 +1110,7 @@ func (b *qqBotServer) getWeather(cityName string) string {
 	q2.Set("city", adcode)
 	q2.Set("extensions", "base")
 	req2.URL.RawQuery = q2.Encode()
-	resp2, err := b.httpClient.Do(req2)
+	resp2, err := b.externalHTTPClient().Do(req2)
 	if err != nil {
 		return fmt.Sprintf("❌ API错误: %v", err)
 	}
@@ -1920,7 +1142,7 @@ func (b *qqBotServer) getEpicFreeGames() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Sprintf("❌ Epic查询失败: %v", err)
 	}
@@ -2008,7 +1230,7 @@ func (b *qqBotServer) getBilibiliHotSearch() string {
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", "https://www.bilibili.com/")
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Sprintf("❌ 错误: %v", err)
 	}
@@ -2063,7 +1285,7 @@ func (b *qqBotServer) resolveBilibiliBVFromURL(rawURL string) (string, error) {
 	}
 	setCrawlerHeaders(req, "https://www.bilibili.com/")
 
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -2100,7 +1322,7 @@ func (b *qqBotServer) parseBilibiliBV(bvid string) (string, string) {
 	q.Set("bvid", bvid)
 	req.URL.RawQuery = q.Encode()
 	setCrawlerHeaders(req, "https://www.bilibili.com/video/"+bvid)
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", fmt.Sprintf("❌ 解析错误: %v", err)
 	}
@@ -2157,7 +1379,7 @@ func (b *qqBotServer) parseBilibiliBVFromHTML(bvid string) (string, string) {
 	pageURL := "https://www.bilibili.com/video/" + bvid
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	setCrawlerHeaders(req, "https://www.bilibili.com/")
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", ""
 	}
@@ -2203,13 +1425,13 @@ func htmlUnescapeLite(s string) string {
 }
 
 func (b *qqBotServer) fetchImageBase64(url string, useProxy bool) (string, error) {
-	client := b.httpClient
-	if useProxy && b.proxyClient != nil {
-		client = b.proxyClient
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	client := b.httpClient
+	if useProxy {
+		client = b.externalHTTPClient()
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -2232,14 +1454,10 @@ func (b *qqBotServer) parseYouTubeVideo(videoID string) (string, string) {
 	url := "https://www.youtube.com/watch?v=" + videoID
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	client := b.proxyClient
-	if client == nil {
-		client = b.httpClient
-	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-	resp, err := client.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", fmt.Sprintf("❌ 解析异常: %v", err)
 	}
@@ -2360,7 +1578,7 @@ func (b *qqBotServer) resolveSteamTarget(raw string) (string, error) {
 	q.Set("key", steamAPIKey)
 	q.Set("vanityurl", vanity)
 	req.URL.RawQuery = q.Encode()
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -2399,7 +1617,7 @@ func (b *qqBotServer) fetchSteamSummaries(ids []string) (map[string]steamPlayerS
 	q.Set("key", steamAPIKey)
 	q.Set("steamids", strings.Join(ids, ","))
 	req.URL.RawQuery = q.Encode()
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -2436,7 +1654,7 @@ func (b *qqBotServer) getSteamFriendsStatus(raw string) string {
 	q.Set("steamid", id)
 	q.Set("relationship", "friend")
 	req.URL.RawQuery = q.Encode()
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "❌ Steam 好友查询失败: " + err.Error()
 	}
@@ -2718,7 +1936,7 @@ func (b *qqBotServer) getSteamDiscounts(query string) string {
 		q.Set("l", "schinese")
 		req.URL.RawQuery = q.Encode()
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36")
-		resp, err := b.httpClient.Do(req)
+		resp, err := b.externalHTTPClient().Do(req)
 		if err != nil {
 			return "❌ Steam 折扣查询失败: " + err.Error()
 		}
@@ -2761,7 +1979,7 @@ func (b *qqBotServer) getSteamDiscounts(query string) string {
 	q.Set("l", "schinese")
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36")
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "❌ Steam 折扣查询失败: " + err.Error()
 	}
@@ -2793,6 +2011,131 @@ func (b *qqBotServer) getSteamDiscounts(query string) string {
 	return strings.Join(lines, "\n")
 }
 
+type searxResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Content string `json:"content"`
+	Engine  string `json:"engine"`
+}
+
+func (b *qqBotServer) searchSearxng(query, categories, timeRange string, limit int) ([]searxResult, error) {
+	if strings.TrimSpace(searxngAPIBase) == "" {
+		return nil, errors.New("未配置 SearXNG 地址（SEARXNG_API_BASE / searxng_api_base）")
+	}
+	if limit <= 0 {
+		limit = 6
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	base := strings.TrimRight(searxngAPIBase, "/") + "/search"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base, nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Set("q", query)
+	q.Set("format", "json")
+	q.Set("language", "zh-CN")
+	q.Set("safesearch", "0")
+	if categories != "" {
+		q.Set("categories", categories)
+	}
+	if timeRange != "" {
+		q.Set("time_range", timeRange)
+	}
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("User-Agent", "yaqqbot/1.0")
+	resp, err := b.externalHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SearXNG status=%d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var raw struct {
+		Results []searxResult `json:"results"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw.Results) > limit {
+		raw.Results = raw.Results[:limit]
+	}
+	return raw.Results, nil
+}
+
+func formatSearxResults(title string, results []searxResult) string {
+	if len(results) == 0 {
+		return "ℹ️ 没有搜索到结果"
+	}
+	lines := []string{title}
+	for i, r := range results {
+		itemTitle := strings.TrimSpace(r.Title)
+		if itemTitle == "" {
+			itemTitle = strings.TrimSpace(r.URL)
+		}
+		snippet := strings.TrimSpace(r.Content)
+		if len(snippet) > 180 {
+			snippet = snippet[:180] + "..."
+		}
+		line := fmt.Sprintf("%d. %s\n%s", i+1, itemTitle, strings.TrimSpace(r.URL))
+		if snippet != "" {
+			line += "\n" + snippet
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		if news {
+			return "❌ 用法: /news 关键词"
+		}
+		return "❌ 用法: /search 关键词"
+	}
+	categories := "general"
+	timeRange := ""
+	title := "🔎 搜索结果:"
+	if news {
+		categories = "news"
+		timeRange = "week"
+		title = "📰 新闻搜索结果:"
+	}
+	results, err := b.searchSearxng(query, categories, timeRange, 8)
+	if err != nil {
+		return "❌ 搜索失败: " + err.Error()
+	}
+	return formatSearxResults(title, results)
+}
+
+func (b *qqBotServer) searchContextForPrompt(prompt string) string {
+	if strings.TrimSpace(searxngAPIBase) == "" || strings.TrimSpace(prompt) == "" {
+		return ""
+	}
+	categories := "general"
+	timeRange := ""
+	lower := strings.ToLower(prompt)
+	if strings.Contains(prompt, "新闻") || strings.Contains(prompt, "最新") || strings.Contains(prompt, "今天") ||
+		strings.Contains(prompt, "最近") || strings.Contains(lower, "news") || strings.Contains(lower, "latest") {
+		categories = "news"
+		timeRange = "week"
+	}
+	results, err := b.searchSearxng(prompt, categories, timeRange, 5)
+	if err != nil || len(results) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("联网搜索结果（来自 SearXNG，请结合但不要盲信；涉及时间敏感问题优先参考这些结果）：\n")
+	for i, r := range results {
+		sb.WriteString(fmt.Sprintf("%d. %s\nURL: %s\n摘要: %s\n", i+1, strings.TrimSpace(r.Title), strings.TrimSpace(r.URL), strings.TrimSpace(r.Content)))
+	}
+	return sb.String()
+}
+
 func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	rawURL = strings.TrimSpace(rawURL)
 	u, err := url.Parse(rawURL)
@@ -2801,7 +2144,7 @@ func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	}
 	bin := findChromeBinary()
 	if bin == "" {
-		return "", "❌ 截图失败: 未找到 Chrome/Chromium，可安装 Google Chrome 或设置 CHROME_BIN"
+		return "", "❌ 截图失败: 未找到 Chrome/Chromium 内核。\n" + browserInstallHint()
 	}
 	tmp, err := os.CreateTemp("", "yaqqbot-web-*.png")
 	if err != nil {
@@ -2825,7 +2168,7 @@ func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Sprintf("❌ 截图失败: %v %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Sprintf("❌ 截图失败: %v %s\n%s", err, strings.TrimSpace(string(out)), browserInstallHint())
 	}
 	pngData, err := os.ReadFile(tmpPath)
 	if err != nil {
@@ -2839,10 +2182,16 @@ func findChromeBinary() string {
 		return v
 	}
 	candidates := []string{
+		"msedge",
+		"edge",
 		"google-chrome",
 		"chromium",
 		"chromium-browser",
 		"microsoft-edge",
+		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
 		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		"/Applications/Chromium.app/Contents/MacOS/Chromium",
 		"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
@@ -2859,6 +2208,17 @@ func findChromeBinary() string {
 		}
 	}
 	return ""
+}
+
+func browserInstallHint() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "请安装 Chrome 或 Edge；如果已安装但仍失败，设置环境变量 CHROME_BIN，例如 C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe"
+	case "darwin":
+		return "请安装 Google Chrome/Chromium/Edge，或设置 CHROME_BIN 指向浏览器可执行文件。"
+	default:
+		return "请安装 Chromium 内核，例如 Ubuntu/Debian: sudo apt-get install -y chromium-browser 或 sudo apt-get install -y chromium；也可设置 CHROME_BIN。"
+	}
 }
 
 // ============ AI 调用 ============
@@ -2917,7 +2277,7 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", origin+"/")
 
-		resp, err := b.httpClient.Do(req)
+		resp, err := b.externalHTTPClient().Do(req)
 		if err != nil {
 			return fmt.Sprintf("❌ GPT 调用失败: %v", err)
 		}
@@ -2971,7 +2331,7 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", origin+"/")
 
-		resp, err := b.httpClient.Do(req)
+		resp, err := b.externalHTTPClient().Do(req)
 		if err != nil {
 			return fmt.Sprintf("❌ GPT 调用失败: %v", err)
 		}
@@ -3039,11 +2399,7 @@ func (b *qqBotServer) callGrokAPI(messages []chatMessage) string {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
 	req.Header.Set("Authorization", "Bearer "+grokAPIKey)
 	req.Header.Set("Content-Type", "application/json")
-	client := b.proxyClient
-	if client == nil {
-		client = b.httpClient
-	}
-	resp, err := client.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Sprintf("❌ Grok Error: %v", err)
 	}
@@ -3082,7 +2438,7 @@ func (b *qqBotServer) callDeepSeekAPI(messages []chatMessage) string {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	req.Header.Set("Authorization", "Bearer "+deepSeekAPIKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Sprintf("❌ DeepSeek 调用失败: %v", err)
 	}
@@ -3142,7 +2498,7 @@ func (b *qqBotServer) callClaudeAPI(systemPrompt string, messages []chatMessage)
 	req.Header.Set("x-api-key", claudeAPIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
@@ -3201,11 +2557,7 @@ func (b *qqBotServer) callGeminiImage(prompt string, width, height int) (imgBase
 	req.Header.Set("x-goog-api-key", geminiAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := b.proxyClient
-	if client == nil {
-		client = b.httpClient
-	}
-	resp, err := client.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -3272,6 +2624,72 @@ func (b *qqBotServer) callGeminiImage(prompt string, width, height int) (imgBase
 		img = resized
 	}
 	return img, text, nil
+}
+
+func (b *qqBotServer) callGPTImage(prompt string, width, height int) (imgBase64 string, text string, err error) {
+	if strings.TrimSpace(gptAPIKey) == "" {
+		return "", "", errors.New("GPT 图片生成未配置 API Key（GPT_API_KEY / gpt_api_key）")
+	}
+	apiBase := openaiutil.NormalizeAPIBase(gptAPIBase)
+	model := strings.TrimSpace(gptImageModel)
+	if model == "" {
+		model = "gpt-image-2"
+	}
+	size := "1024x1024"
+	if width > 0 && height > 0 {
+		size = fmt.Sprintf("%dx%d", width, height)
+	}
+	reqBody := map[string]any{
+		"model":  model,
+		"prompt": prompt,
+		"size":   size,
+		"n":      1,
+	}
+	data, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(apiBase, "/")+"/images/generations", bytes.NewReader(data))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+gptAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.externalHTTPClient().Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("OpenAI Images API Error: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var raw struct {
+		Data []struct {
+			B64JSON       string `json:"b64_json"`
+			URL           string `json:"url"`
+			RevisedPrompt string `json:"revised_prompt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "", "", err
+	}
+	if len(raw.Data) == 0 {
+		return "", "", errors.New("OpenAI Images API 返回为空")
+	}
+	if raw.Data[0].B64JSON != "" {
+		imgBase64 = "base64://" + strings.TrimSpace(raw.Data[0].B64JSON)
+	} else if raw.Data[0].URL != "" {
+		imgBase64, err = b.fetchImageBase64(raw.Data[0].URL, true)
+		if err != nil {
+			return "", "", err
+		}
+	} else {
+		return "", "", errors.New("OpenAI Images API 未返回图片数据")
+	}
+	if raw.Data[0].RevisedPrompt != "" {
+		text = "修订提示词: " + raw.Data[0].RevisedPrompt
+	}
+	return imgBase64, text, nil
 }
 
 func parseImageCommand(raw string) (prompt string, width int, height int, err error) {
@@ -3492,11 +2910,7 @@ func (b *qqBotServer) downloadImageToTemp(srcURL string) (string, error) {
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	client := b.proxyClient
-	if client == nil {
-		client = b.httpClient
-	}
-	resp, err := client.Do(req)
+	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -3850,22 +3264,19 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			responseText = "🤖 帮助:\n" +
 				"/ct [问题]           - 问答\n" +
 				"/deepseek [问题]     - 使用 DeepSeek agent\n" +
-				"/img [尺寸] [提示词] - Gemini 生成图片，如 /img 1024x768 赛博城市\n" +
+				"/img [尺寸] [提示词] - GPT 图片生成，如 /img 1024x1024 赛博城市\n" +
+				"/gimg [尺寸] [提示词] - Gemini 图片生成\n" +
+				"/search [关键词]     - SearXNG 联网搜索\n" +
+				"/news [关键词]       - SearXNG 新闻搜索\n" +
 				"//web [URL]          - 无头浏览器打开网页并截图\n" +
+				"/webcheck            - 检查无头浏览器内核\n" +
+				"/socks on|off|status - 开关外部请求代理\n" +
 				"//whatch [SteamID/好友代码/自定义名/链接] - 加入 Steam 监控\n" +
 				"//whatchrm [名字/SteamID] - 删除 Steam 监控\n" +
 				"//list               - 查看 Steam 监控列表\n" +
 				"//friends [SteamID/链接] - 查看公开好友在线/游戏状态\n" +
 				"//buy [关键词]       - 查询 Steam 折扣，不填显示热门折扣\n" +
 				"/ping [域名]         - 代理测速\n" +
-				"/nginx ...           - 管理 Nginx stream/远程转发\n" +
-				"  /nginx list        - 列出当前配置\n" +
-				"  /nginx add ...     - 新增/更新转发\n" +
-				"  /nginx rm 名字     - 删除转发\n" +
-				"  /nginx -t          - 测试 nginx 配置语法\n" +
-				"  /nginx mkdir 名称  - 初始化/选择配置文件\n" +
-				"  /nginx set 名称    - 切换默认被控服务器\n" +
-				"  /nginx server ...  - 管理被控服务器\n" +
 				"/set [模型]          - 个人模型\n" +
 				"/setall [模型]       - 群模型\n" +
 				"/clear               - 清除记忆\n" +
@@ -3875,6 +3286,32 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				"/bv [BV号/on/off]"
 		case strings.HasPrefix(commandMsg, "/ping "):
 			responseText = b.pingViaProxy(strings.TrimSpace(commandMsg[6:]))
+		case strings.HasPrefix(commandMsg, "/socks"):
+			arg := strings.ToLower(strings.TrimSpace(commandMsg[len("/socks"):]))
+			switch arg {
+			case "on":
+				if strings.TrimSpace(socks5Proxy) == "" {
+					responseText = "❌ 未配置 socks5_proxy / SOCKS5_PROXY"
+				} else {
+					b.setProxyEnabled(true)
+					responseText = "✅ 已开启代理: " + socks5Proxy
+				}
+			case "off":
+				b.setProxyEnabled(false)
+				responseText = "✅ 已关闭代理"
+			case "", "status":
+				status := "关闭"
+				if b.isProxyEnabled() {
+					status = "开启"
+				}
+				responseText = fmt.Sprintf("🧦 代理状态: %s\n代理地址: %s", status, strings.TrimSpace(socks5Proxy))
+			default:
+				responseText = "❌ 用法: /socks on|off|status"
+			}
+		case strings.HasPrefix(commandMsg, "/search "):
+			responseText = b.handleSearchCommand(strings.TrimSpace(commandMsg[len("/search "):]), false)
+		case strings.HasPrefix(commandMsg, "/news "):
+			responseText = b.handleSearchCommand(strings.TrimSpace(commandMsg[len("/news "):]), true)
 		case strings.HasPrefix(commandMsg, "/img "):
 			p, w, h, err := parseImageCommand(strings.TrimSpace(commandMsg[5:]))
 			if err != nil {
@@ -3885,16 +3322,39 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				responseText = "❌ 用法: /img [可选尺寸如 1024x768] 你的提示词"
 				break
 			}
-			img, txt, err := b.callGeminiImage(p, w, h)
+			img, txt, err := b.callGPTImage(p, w, h)
 			if err != nil {
-				responseText = "❌ Gemini 生成失败: " + err.Error()
+				responseText = "❌ GPT 图片生成失败: " + err.Error()
 			} else {
 				responseImg = img
-				// 支持 Gemini 同时返回的文本说明；有的响应可能仅返回文字。
+				responseText = strings.TrimSpace(txt)
+			}
+		case strings.HasPrefix(commandMsg, "/gimg "):
+			p, w, h, err := parseImageCommand(strings.TrimSpace(commandMsg[len("/gimg "):]))
+			if err != nil {
+				responseText = "❌ " + err.Error()
+				break
+			}
+			if p == "" {
+				responseText = "❌ 用法: /gimg [可选尺寸如 1024x768] 你的提示词"
+				break
+			}
+			img, txt, err := b.callGeminiImage(p, w, h)
+			if err != nil {
+				responseText = "❌ Gemini 图片生成失败: " + err.Error()
+			} else {
+				responseImg = img
 				responseText = strings.TrimSpace(txt)
 			}
 		case strings.HasPrefix(commandMsg, "/web "):
 			responseImg, responseText = b.captureWebScreenshot(strings.TrimSpace(commandMsg[5:]))
+		case strings.TrimSpace(commandMsg) == "/webcheck":
+			bin := findChromeBinary()
+			if bin == "" {
+				responseText = "❌ 未找到无头浏览器内核。\n" + browserInstallHint()
+			} else {
+				responseText = "✅ 已找到浏览器内核:\n" + bin
+			}
 		case strings.HasPrefix(commandMsg, "/whatch "):
 			responseText = b.handleSteamWatchCommand(strings.TrimSpace(commandMsg[len("/whatch "):]))
 		case strings.HasPrefix(commandMsg, "/watch "):
@@ -3909,9 +3369,6 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			responseText = b.getSteamFriendsStatus(strings.TrimSpace(commandMsg[len("/friends "):]))
 		case strings.HasPrefix(commandMsg, "/buy"):
 			responseText = b.getSteamDiscounts(strings.TrimSpace(commandMsg[len("/buy"):]))
-		case strings.HasPrefix(commandMsg, "/nginx"):
-			args := strings.TrimSpace(commandMsg[len("/nginx"):])
-			responseText = b.handleNginxCommand(args, userID, msgType)
 		case strings.HasPrefix(commandMsg, "/天气 "):
 			responseText = b.getWeather(strings.TrimSpace(commandMsg[4:]))
 		case strings.HasPrefix(commandMsg, "/rs"):
@@ -4045,6 +3502,9 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				evb.WriteString(fmt.Sprintf("- %s [%s] %s\n", ev.Time, ev.Type, ev.Detail))
 			}
 			msgs = append(msgs, chatMessage{Role: "system", Content: evb.String()})
+		}
+		if searchCtx := b.searchContextForPrompt(prompt); searchCtx != "" {
+			msgs = append(msgs, chatMessage{Role: "system", Content: searchCtx})
 		}
 		for _, h := range history {
 			if h.Content == "" {
