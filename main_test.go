@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -63,5 +64,23 @@ func TestLowDetailSearchReasonAcceptsRepoEvidence(t *testing.T) {
 	answer := "1. OpenAI/codex - https://github.com/openai/codex - 终端编码代理。\n2. astral-sh/uv - https://github.com/astral-sh/uv - Python 包管理工具。"
 	if reason := lowDetailSearchReason("github 好玩的开源项目", answer); reason != "" {
 		t.Fatalf("expected repo evidence to pass, got: %s", reason)
+	}
+}
+
+func TestBuildConciseSearchPromptForProjectDiscoveryIsShortAndConcrete(t *testing.T) {
+	prompt := buildConciseSearchPrompt("给我搜几个好玩的github项目给我", false, true)
+	for _, want := range []string{"5 concrete GitHub repositories", "owner/repo", "github.com URL", "No trend summary"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("concise project prompt missing %q: %s", want, prompt)
+		}
+	}
+	if len([]rune(prompt)) > 260 {
+		t.Fatalf("concise project prompt is too long: %d %s", len([]rune(prompt)), prompt)
+	}
+}
+
+func TestIsGeminiSearchTimeout(t *testing.T) {
+	if !isGeminiSearchTimeout(errors.New("Gemini Search status=502 {\"error\":{\"message\":\"Query timed out\"}}")) {
+		t.Fatalf("expected timeout error to be detected")
 	}
 }
