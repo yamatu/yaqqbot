@@ -1201,7 +1201,7 @@ func (b *qqBotServer) getEpicFreeGames() string {
 }
 
 func (b *qqBotServer) getSixtyImage() (string, string) {
-	img, err := b.fetchImageBase64(strings.TrimRight(sixtyAPIBase, "/")+"/v2/60s?encoding=image-proxy", true)
+	img, err := b.fetchImageToLocalCQFile(strings.TrimRight(sixtyAPIBase, "/") + "/v2/60s?encoding=image-proxy")
 	if err != nil {
 		return "", "❌ 获取 60s 读懂世界图片失败: " + err.Error()
 	}
@@ -1232,14 +1232,53 @@ func (b *qqBotServer) getAINewsImage() (string, string) {
 	if len(lines) == 0 {
 		lines = []string{"今日 AI 资讯快报暂无内容。"}
 	}
-	img, err := renderNewsImage("AI 资讯快报", raw.Data.Date, lines)
+	img, err := renderNewsImageLocalCQFile("AI 资讯快报", raw.Data.Date, lines)
 	if err != nil {
 		return "", "❌ 生成 AI 资讯快报图片失败: " + err.Error()
 	}
 	return img, "🤖 AI 资讯快报"
 }
 
-func renderNewsImage(title, date string, items []string) (string, error) {
+func (b *qqBotServer) fetchImageToLocalCQFile(rawURL string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := b.externalHTTPClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return "", err
+	}
+	ext := imageExtFromContentType(resp.Header.Get("Content-Type"))
+	if ext == ".img" {
+		ext = imageExtFromContentType(http.DetectContentType(data))
+	}
+	p, err := writeBytesToTempImage(data, ext)
+	if err != nil {
+		return "", err
+	}
+	return localFileToCQ(p), nil
+}
+
+func localFileToCQ(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}
+	return u.String()
+}
+
+func renderNewsImageLocalCQFile(title, date string, items []string) (string, error) {
 	const width = 900
 	const margin = 48
 	regular := loadFontFace(24)
@@ -1285,7 +1324,11 @@ func renderNewsImage(title, date string, items []string) (string, error) {
 	if err := png.Encode(&buf, img); err != nil {
 		return "", err
 	}
-	return "base64://" + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+	p, err := writeBytesToTempImage(buf.Bytes(), ".png")
+	if err != nil {
+		return "", err
+	}
+	return localFileToCQ(p), nil
 }
 
 func drawString(img *image.RGBA, face font.Face, x, y int, text string, c color.Color) {
