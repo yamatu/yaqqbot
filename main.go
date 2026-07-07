@@ -103,7 +103,7 @@ var (
 	amapAPIKey          = os.Getenv("AMAP_API_KEY")
 	bilibiliAPIBase     = envOrDefault("BILIBILI_API_BASE", "https://api.bilibili.com/x/web-interface/view")
 	sixtyAPIBase        = envOrDefault("SIXTY_API_BASE", "https://60s.viki.moe")
-	geminiSearchAPIBase = envOrDefault("GEMINI_SEARCH_API_BASE", "")
+	geminiSearchAPIBase = envOrDefault("GEMINI_SEARCH_API_BASE", "http://127.0.0.1:8080")
 	geminiSearchAPIKey  = os.Getenv("GEMINI_SEARCH_API_KEY")
 	geminiSearchModel   = envOrDefault("GEMINI_SEARCH_MODEL", "gemini-search")
 
@@ -2297,6 +2297,27 @@ func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
 	return title + ":\n" + answer
 }
 
+func (b *qqBotServer) handleSearchCheck() string {
+	endpoint, err := geminiSearchURL()
+	if err != nil {
+		return "❌ Gemini Search 配置错误: " + err.Error()
+	}
+	model := strings.TrimSpace(geminiSearchModel)
+	if model == "" {
+		model = "gemini-search"
+	}
+	start := time.Now()
+	answer, err := b.callGeminiSearch("what is 7*8? answer only the number")
+	if err != nil {
+		return fmt.Sprintf("❌ Gemini Search 不可用或返回空内容\n接口: %s\n错误: %v\n启动命令: scripts/start_gemini_search_mcp.sh\n如遇 Google CAPTCHA，先运行: HEADLESS=0 scripts/start_gemini_search_mcp.sh", endpoint, err)
+	}
+	answer = strings.TrimSpace(answer)
+	if len(answer) > 200 {
+		answer = answer[:200] + "..."
+	}
+	return fmt.Sprintf("✅ Gemini Search 可用\n接口: %s\n模型: %s\n耗时: %s\n响应: %s\nDeepSeek/GPT/Claude/Grok 对话都会自动附加联网搜索摘要。", endpoint, model, time.Since(start).Round(time.Millisecond), answer)
+}
+
 func (b *qqBotServer) searchContextForPrompt(prompt string) string {
 	if strings.TrimSpace(geminiSearchAPIBase) == "" || strings.TrimSpace(prompt) == "" {
 		return ""
@@ -3440,6 +3461,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				"/gimg [尺寸] [提示词] - Gemini 图片生成\n" +
 				"/search [关键词]     - Gemini Search 联网搜索\n" +
 				"/news [关键词]       - Gemini Search 新闻搜索\n" +
+				"/searchcheck         - 检查 Gemini Search 服务\n" +
 				"/60s                 - 60s 读懂世界图片\n" +
 				"/ainews              - AI 资讯快报图片\n" +
 				"//web [URL]          - 无头浏览器打开网页并截图\n" +
@@ -3486,6 +3508,8 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			responseText = b.handleSearchCommand(strings.TrimSpace(commandMsg[len("/search "):]), false)
 		case strings.HasPrefix(commandMsg, "/news "):
 			responseText = b.handleSearchCommand(strings.TrimSpace(commandMsg[len("/news "):]), true)
+		case strings.TrimSpace(commandMsg) == "/searchcheck":
+			responseText = b.handleSearchCheck()
 		case strings.TrimSpace(commandMsg) == "/60s":
 			responseImg, responseText = b.getSixtyImage()
 		case strings.TrimSpace(commandMsg) == "/ainews" || strings.TrimSpace(commandMsg) == "/ai-news":
