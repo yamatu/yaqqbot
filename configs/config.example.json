@@ -60,8 +60,9 @@
   // Windows 先启动: powershell -ExecutionPolicy Bypass -File scripts/start_gemini_search_mcp.ps1
   // 或双击/运行: scripts/start_gemini_search_mcp.bat
   // 如果首次启动遇到 Google CAPTCHA，先运行:
-  // powershell -ExecutionPolicy Bypass -File scripts/start_gemini_search_mcp.ps1 -NoHeadless
-  // 在弹出的 Chrome 中完成验证后，Ctrl+C 停止，再正常无头启动。
+  // scripts/prime_gemini_search_chrome.bat
+  // 在弹出的 Chrome 中完成验证后，再运行 scripts/start_gemini_search_mcp.bat。
+  // 如果无头仍失败，可直接运行 scripts/start_gemini_search_mcp_cdp.bat。
   // 项目: https://github.com/Sophomoresty/gemini-search-mcp
   // 可填根地址、/v1 或完整 /v1/chat/completions。
   "gemini_search_api_base": "http://127.0.0.1:8080",
