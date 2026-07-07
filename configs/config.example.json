@@ -56,9 +56,15 @@
   // B 站视频解析接口；失败时会回退到网页爬取。
   "bilibili_api_base": "https://api.bilibili.com/x/web-interface/view",
 
-  // gemini-search-mcp 的 OpenAI 兼容接口地址。可填根地址、/v1 或完整 /v1/chat/completions。
+  // gemini-search-mcp 的 OpenAI 兼容接口地址。默认本机 8080。
+  // 先启动: scripts/start_gemini_search_mcp.sh
+  // 如果首次启动遇到 Google CAPTCHA，先运行:
+  // HEADLESS=0 scripts/start_gemini_search_mcp.sh
+  // 在弹出的 Chrome 中完成验证后，Ctrl+C 停止，再正常无头启动。
   // 项目: https://github.com/Sophomoresty/gemini-search-mcp
+  // 可填根地址、/v1 或完整 /v1/chat/completions。
   "gemini_search_api_base": "http://127.0.0.1:8080",
+  // gemini-search-mcp 不需要真实 API Key；若你前面套了鉴权网关再填写。
   "gemini_search_api_key": "",
   "gemini_search_model": "gemini-search",
 
