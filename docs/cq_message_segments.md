@@ -148,13 +148,13 @@ Steam 配置：
 
 联网搜索配置：
 
-- 先启动本机搜索服务：`scripts/start_gemini_search_mcp.sh`
-- 本机推荐安装到独立 venv：
-  - `brew install python@3.12 expat`
-  - `/opt/homebrew/bin/python3.12 -m venv ~/.local/share/gemini-search-mcp/venv`
-  - `DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib ~/.local/share/gemini-search-mcp/venv/bin/pip install git+https://github.com/Sophomoresty/gemini-search-mcp.git`
-- 如果首次启动遇到 Google CAPTCHA，先运行 `HEADLESS=0 scripts/start_gemini_search_mcp.sh`，在弹出的 Chrome 中完成验证后停止进程，再运行 `scripts/start_gemini_search_mcp.sh`
-- 如需代理 Google 搜索侧流量，可设置 `GEMINI_SEARCH_PROXY_SERVER=socks5://127.0.0.1:7890`；脚本也会在该变量为空时复用 `SOCKS5_PROXY`
+- Windows 启动本机搜索服务：`powershell -ExecutionPolicy Bypass -File scripts/start_gemini_search_mcp.ps1`
+- 也可以在 cmd 里运行：`scripts\start_gemini_search_mcp.bat`
+- 脚本会自动创建 `%LOCALAPPDATA%\gemini-search-mcp\venv`，并安装 gemini-search-mcp；如果提示缺少 Python，先运行 `winget install Python.Python.3.12`
+- gemini-search-mcp 需要 Chrome/Edge/Chromium；如果 Windows 机器没有浏览器内核，先运行 `winget install Google.Chrome`
+- 如果首次启动遇到 Google CAPTCHA，先运行 `powershell -ExecutionPolicy Bypass -File scripts/start_gemini_search_mcp.ps1 -NoHeadless`，在弹出的 Chrome 中完成验证后停止进程，再正常运行启动命令
+- 如需代理 Google 搜索侧流量，可设置 `$env:GEMINI_SEARCH_PROXY_SERVER="socks5://127.0.0.1:7890"`；脚本也会在该变量为空时复用 `SOCKS5_PROXY`
+- macOS/Linux 可运行：`scripts/start_gemini_search_mcp.sh`
 - `GEMINI_SEARCH_API_BASE` / `gemini_search_api_base`：gemini-search-mcp 的 OpenAI 兼容接口地址，默认 `http://127.0.0.1:8080`；也可填 `http://127.0.0.1:8080/v1` 或完整 `/v1/chat/completions`
 - `GEMINI_SEARCH_API_KEY` / `gemini_search_api_key`：gemini-search-mcp 不需要真实 API Key；如果你前面套了鉴权网关再填写
 - `GEMINI_SEARCH_MODEL` / `gemini_search_model`：默认 `gemini-search`
