@@ -2310,6 +2310,25 @@ func buildDetailedSearchPrompt(query string, news bool, forAgent bool) string {
 	return sb.String()
 }
 
+func buildConciseSearchPrompt(query string, news bool, forAgent bool) string {
+	query = strings.TrimSpace(query)
+	if isProjectDiscoveryQuery(query) {
+		return "Search current web/GitHub for: " + query + "\n" +
+			"Return in Chinese. List 5 concrete GitHub repositories only. Format each item: project name | owner/repo | github.com URL | why it is interesting | stars or recent activity if available. No trend summary."
+	}
+	var sb strings.Builder
+	sb.WriteString("联网搜索: ")
+	sb.WriteString(query)
+	if news {
+		sb.WriteString("。优先最新新闻。")
+	}
+	if forAgent {
+		sb.WriteString("。给另一个 AI 使用，请保留关键事实和来源。")
+	}
+	sb.WriteString("。用中文输出：结论、关键事实、来源链接。")
+	return sb.String()
+}
+
 func isProjectDiscoveryQuery(query string) bool {
 	q := strings.ToLower(query)
 	return strings.Contains(q, "github") || strings.Contains(q, "repo") || strings.Contains(q, "repository") ||
@@ -2362,10 +2381,28 @@ func buildSearchRetryPrompt(query, firstAnswer, reason string, news bool, forAge
 	return sb.String()
 }
 
+func isGeminiSearchTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "query timed out") || strings.Contains(msg, "status=502")
+}
+
 func (b *qqBotServer) callDetailedGeminiSearch(query string, news bool, forAgent bool, strict bool) (string, error) {
-	answer, err := b.callGeminiSearch(buildDetailedSearchPrompt(query, news, forAgent))
+	firstPrompt := buildDetailedSearchPrompt(query, news, forAgent)
+	if isProjectDiscoveryQuery(query) {
+		firstPrompt = buildConciseSearchPrompt(query, news, forAgent)
+	}
+	answer, err := b.callGeminiSearch(firstPrompt)
 	if err != nil {
-		return "", err
+		if !isGeminiSearchTimeout(err) {
+			return "", err
+		}
+		answer, err = b.callGeminiSearch(buildConciseSearchPrompt(query, news, forAgent))
+		if err != nil {
+			return "", err
+		}
 	}
 	if reason := lowDetailSearchReason(query, answer); reason != "" {
 		retry, retryErr := b.callGeminiSearch(buildSearchRetryPrompt(query, answer, reason, news, forAgent))
