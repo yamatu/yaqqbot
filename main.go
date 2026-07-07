@@ -2245,7 +2245,7 @@ func (b *qqBotServer) callGeminiSearch(prompt string) (string, error) {
 	reqBody := map[string]any{
 		"model": model,
 		"messages": []chatMessage{
-			{Role: "system", Content: "你是联网搜索助手。请基于实时搜索结果回答，列出关键信息和来源链接；如果没有可靠结果，请明确说明。"},
+			{Role: "system", Content: "你是联网搜索资料整理助手。请基于实时网页结果给出尽可能详细、可核验的事实，不要只给一句结论。必须列出关键时间、地点/赛事/机构、人物、数字、比分/金额/版本等可用细节，并附来源链接；如果没有可靠结果，请明确说明。"},
 			{Role: "user", Content: prompt},
 		},
 		"temperature": 0.2,
@@ -2284,6 +2284,29 @@ func (b *qqBotServer) callGeminiSearch(prompt string) (string, error) {
 	return strings.TrimSpace(raw.Choices[0].Message.Content), nil
 }
 
+func buildDetailedSearchPrompt(query string, news bool, forAgent bool) string {
+	query = strings.TrimSpace(query)
+	var sb strings.Builder
+	sb.WriteString("请进行深度联网搜索并整理资料。当前日期: ")
+	sb.WriteString(time.Now().Format("2006-01-02"))
+	sb.WriteString("。\n")
+	if news {
+		sb.WriteString("搜索范围优先放在最新新闻、公告、赛事报道、官方页面和可信媒体。\n")
+	}
+	if forAgent {
+		sb.WriteString("这些资料会交给另一个 AI 回答用户问题，所以请尽量完整保留事实细节，而不是只写结论。\n")
+	}
+	sb.WriteString("用户问题: ")
+	sb.WriteString(query)
+	sb.WriteString("\n\n输出要求:\n")
+	sb.WriteString("1. 先给直接结论。\n")
+	sb.WriteString("2. 列出详细事实：时间、地点/赛事/机构、相关人物、队伍/公司、比分/金额/版本/奖项等数字信息；没有则写未检索到。\n")
+	sb.WriteString("3. 如果问题涉及电竞/体育赛事，必须尽量列出赛事名称、日期、对阵双方、比分/名次、选手所属队伍、冠军/奖项和后续影响。\n")
+	sb.WriteString("4. 如果搜索结果存在不同说法，分别列出并说明来源差异。\n")
+	sb.WriteString("5. 最后列出来源链接或来源名称；不要省略来源。\n")
+	return sb.String()
+}
+
 func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -2292,10 +2315,9 @@ func (b *qqBotServer) handleSearchCommand(query string, news bool) string {
 		}
 		return "❌ 用法: /search 关键词"
 	}
-	prompt := query
+	prompt := buildDetailedSearchPrompt(query, news, false)
 	title := "🔎 联网搜索"
 	if news {
-		prompt = "请搜索并总结最新新闻/事件：" + query
 		title = "📰 新闻搜索"
 	}
 	answer, err := b.callGeminiSearch(prompt)
@@ -2330,7 +2352,7 @@ func (b *qqBotServer) searchContextForPrompt(prompt string) (string, error) {
 	if strings.TrimSpace(geminiSearchAPIBase) == "" || strings.TrimSpace(prompt) == "" {
 		return "", errors.New("Gemini Search 未配置或问题为空")
 	}
-	answer, err := b.callGeminiSearch("请为下面的问题搜索实时资料，输出简短摘要和来源链接，供另一个 AI 回答时参考：\n" + prompt)
+	answer, err := b.callGeminiSearch(buildDetailedSearchPrompt(prompt, false, true))
 	if err != nil || strings.TrimSpace(answer) == "" {
 		if err == nil {
 			err = errors.New("Gemini Search 返回为空")
