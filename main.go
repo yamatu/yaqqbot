@@ -2318,15 +2318,20 @@ func (b *qqBotServer) handleSearchCheck() string {
 	return fmt.Sprintf("✅ Gemini Search 可用\n接口: %s\n模型: %s\n耗时: %s\n响应: %s\nDeepSeek/GPT/Claude/Grok 对话都会自动附加联网搜索摘要。", endpoint, model, time.Since(start).Round(time.Millisecond), answer)
 }
 
-func (b *qqBotServer) searchContextForPrompt(prompt string) string {
+func (b *qqBotServer) searchContextForPrompt(prompt string) (string, error) {
 	if strings.TrimSpace(geminiSearchAPIBase) == "" || strings.TrimSpace(prompt) == "" {
-		return ""
+		return "", errors.New("Gemini Search 未配置或问题为空")
 	}
 	answer, err := b.callGeminiSearch("请为下面的问题搜索实时资料，输出简短摘要和来源链接，供另一个 AI 回答时参考：\n" + prompt)
 	if err != nil || strings.TrimSpace(answer) == "" {
-		return ""
+		if err == nil {
+			err = errors.New("Gemini Search 返回为空")
+		}
+		return "", err
 	}
-	return "联网搜索摘要（来自 gemini-search-mcp，请结合但不要盲信；涉及时间敏感问题优先参考这些结果）：\n" + answer
+	return "联网搜索摘要（来自 gemini-search-mcp）。当前日期: " + time.Now().Format("2006-01-02") + "。\n" +
+		"涉及新闻、价格、版本、政策、人物/公司状态、近期事件等时效性问题时，必须优先依据以下实时搜索摘要和来源链接回答，不要只依赖模型训练数据；如果搜索摘要与旧知识冲突，以搜索摘要为准并说明不确定性。\n" +
+		answer, nil
 }
 
 func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
@@ -3374,12 +3379,29 @@ func compactChatMessages(messages []chatMessage, maxChars int) []chatMessage {
 	if len(messages) <= 4 {
 		return messages
 	}
-	system := messages[0]
+
+	prefixEnd := 0
+	for prefixEnd < len(messages) && messages[prefixEnd].Role == "system" {
+		prefixEnd++
+	}
+	if prefixEnd == 0 {
+		prefixEnd = 1
+	}
+	prefix := append([]chatMessage(nil), messages[:prefixEnd]...)
+
 	tail := make([]chatMessage, 0)
 	tailChars := 0
-	for i := len(messages) - 1; i >= 1; i-- {
+	prefixChars := 0
+	for _, m := range prefix {
+		prefixChars += len(m.Content)
+	}
+	tailBudget := maxChars - prefixChars
+	if tailBudget < maxChars/3 {
+		tailBudget = maxChars / 3
+	}
+	for i := len(messages) - 1; i >= prefixEnd; i-- {
 		c := len(messages[i].Content)
-		if len(tail) >= 6 && tailChars+c > maxChars*2/3 {
+		if len(tail) >= 6 && tailChars+c > tailBudget {
 			break
 		}
 		tail = append(tail, messages[i])
@@ -3388,12 +3410,12 @@ func compactChatMessages(messages []chatMessage, maxChars int) []chatMessage {
 	for i, j := 0, len(tail)-1; i < j; i, j = i+1, j-1 {
 		tail[i], tail[j] = tail[j], tail[i]
 	}
-	omitted := len(messages) - 1 - len(tail)
+	omitted := len(messages) - prefixEnd - len(tail)
 	summary := chatMessage{
 		Role:    "system",
-		Content: fmt.Sprintf("较早的 %d 条历史已被折叠，以控制上下文长度。请优先依据最近消息和用户长期事件记忆回答。", omitted),
+		Content: fmt.Sprintf("较早的 %d 条历史已被折叠，以控制上下文长度。请优先依据保留的系统指令、联网搜索摘要、最近消息和用户长期事件记忆回答。", omitted),
 	}
-	out := []chatMessage{system, summary}
+	out := append(prefix, summary)
 	out = append(out, tail...)
 	return out
 }
@@ -3697,6 +3719,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		}
 		b.memoryMu.RUnlock()
 		msgs := []chatMessage{{Role: "system", Content: systemPrompt}}
+		searchStatusText := ""
 		if events := b.recentUserEvents(userID, 12); len(events) > 0 {
 			var evb strings.Builder
 			evb.WriteString("用户近期事件记忆:\n")
@@ -3705,8 +3728,19 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			}
 			msgs = append(msgs, chatMessage{Role: "system", Content: evb.String()})
 		}
-		if searchCtx := b.searchContextForPrompt(prompt); searchCtx != "" {
+		searchCtx, searchErr := b.searchContextForPrompt(prompt)
+		if searchCtx != "" {
 			msgs = append(msgs, chatMessage{Role: "system", Content: searchCtx})
+			searchStatusText = "🌐 已结合联网搜索\n"
+			if modelKey == "deepseek" {
+				msgs = append(msgs, chatMessage{Role: "system", Content: "DeepSeek 联网要求：本轮已提供实时联网搜索摘要。回答时必须结合该摘要；涉及时效性事实时，不要只使用 DeepSeek 训练数据。"})
+			}
+		} else if searchErr != nil {
+			b.logger.Printf("联网搜索摘要生成失败 model=%s user=%s group=%s: %v", modelKey, userID, groupID, searchErr)
+			if modelKey == "deepseek" {
+				msgs = append(msgs, chatMessage{Role: "system", Content: "DeepSeek 联网状态：本轮尝试获取实时联网搜索摘要失败，错误为：" + searchErr.Error() + "。涉及最新信息、新闻、版本、价格、政策、人物或公司状态时，必须明确说明未能成功联网检索，不要假装已使用实时网络资料。"})
+				searchStatusText = "⚠️ 联网搜索失败，DeepSeek 将按未联网状态回答\n"
+			}
 		}
 		for _, h := range history {
 			if h.Content == "" {
@@ -3729,7 +3763,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 		}
 		b.appendHistory(userID, "user", prompt)
 		b.appendHistory(userID, "assistant", ans)
-		responseText = fmt.Sprintf("🤖 [%s]\n%s", modelKey, ans)
+		responseText = fmt.Sprintf("🤖 [%s]\n%s%s", modelKey, searchStatusText, ans)
 	}
 
 	if responseText != "" || responseImg != "" {
