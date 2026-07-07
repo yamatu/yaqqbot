@@ -1,7 +1,7 @@
 @echo off
 setlocal
 if "%GEMINI_SEARCH_CDP_PORT%"=="" set GEMINI_SEARCH_CDP_PORT=9222
-call "%~dp0prime_gemini_search_chrome.bat"
+call "%~dp0prime_gemini_search_chrome.bat" || exit /b 1
 echo.
 echo Finish any Google CAPTCHA in the opened Chrome window, then press Enter.
 pause >nul
