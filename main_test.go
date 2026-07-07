@@ -84,3 +84,14 @@ func TestIsGeminiSearchTimeout(t *testing.T) {
 		t.Fatalf("expected timeout error to be detected")
 	}
 }
+
+func TestNormalizeChatCompletionsBaseForGrok(t *testing.T) {
+	got := normalizeChatCompletionsBase("https://api.x.ai")
+	if got != "https://api.x.ai/v1" {
+		t.Fatalf("unexpected normalized base: %s", got)
+	}
+	got = normalizeChatCompletionsBase("https://api.x.ai/v1/chat/completions")
+	if got != "https://api.x.ai/v1" {
+		t.Fatalf("unexpected normalized full URL: %s", got)
+	}
+}

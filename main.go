@@ -2461,7 +2461,7 @@ func (b *qqBotServer) handleSearchCheck() string {
 	if len(answer) > 200 {
 		answer = answer[:200] + "..."
 	}
-	return fmt.Sprintf("✅ Gemini Search 可用\n接口: %s\n模型: %s\n耗时: %s\n响应: %s\nDeepSeek/GPT/Claude/Grok 对话都会自动附加联网搜索摘要。", endpoint, model, time.Since(start).Round(time.Millisecond), answer)
+	return fmt.Sprintf("✅ Gemini Search 可用\n接口: %s\n模型: %s\n耗时: %s\n响应: %s\nDeepSeek 对话会自动附加联网搜索摘要；其他模型只在使用 /search 或 /news 时联网。", endpoint, model, time.Since(start).Round(time.Millisecond), answer)
 }
 
 func (b *qqBotServer) searchContextForPrompt(prompt string) (string, error) {
@@ -2741,11 +2741,24 @@ func buildConversationPrompt(messages []chatMessage) string {
 	return b.String()
 }
 
+func normalizeChatCompletionsBase(raw string) string {
+	base := openaiutil.NormalizeAPIBase(raw)
+	base = strings.TrimRight(base, "/")
+	if strings.HasSuffix(base, "/chat/completions") {
+		return strings.TrimSuffix(base, "/chat/completions")
+	}
+	if strings.HasSuffix(base, "/v1") {
+		return base
+	}
+	return base + "/v1"
+}
+
 func (b *qqBotServer) callGrokAPI(messages []chatMessage) string {
 	if grokAPIKey == "" {
 		return "❌ Grok 未配置 API Key"
 	}
-	url := strings.TrimRight(grokAPIBase, "/") + "/chat/completions"
+	apiBase := normalizeChatCompletionsBase(grokAPIBase)
+	url := apiBase + "/chat/completions"
 	reqBody := map[string]any{
 		"model":      grokModel,
 		"messages":   messages,
@@ -2754,24 +2767,31 @@ func (b *qqBotServer) callGrokAPI(messages []chatMessage) string {
 	data, _ := json.Marshal(reqBody)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	req.Header.Set("Authorization", "Bearer "+grokAPIKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	resp, err := b.externalHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Sprintf("❌ Grok Error: %v", err)
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Sprintf("Grok Error: %d", resp.StatusCode)
+		return fmt.Sprintf("Grok Error: %d %s", resp.StatusCode, trimForMemory(string(body), 800))
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	trimmed := strings.TrimSpace(string(body))
+	if strings.HasPrefix(trimmed, "<") || (ct != "" && !strings.Contains(ct, "json")) {
+		return fmt.Sprintf("❌ Grok 返回的不是 JSON，可能是 grok_api_base 配错或被网关/反代拦截。\n当前接口: %s\nContent-Type: %s\n响应片段: %s", url, resp.Header.Get("Content-Type"), trimForMemory(trimmed, 500))
 	}
 	var raw struct {
 		Choices []struct {
 			Message chatMessage `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return fmt.Sprintf("❌ Grok Error: %v", err)
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Sprintf("❌ Grok JSON 解析失败: %v\n接口: %s\n响应片段: %s", err, url, trimForMemory(trimmed, 500))
 	}
 	if len(raw.Choices) == 0 {
 		return "❌ Grok 返回为空"
@@ -3889,19 +3909,17 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			}
 			msgs = append(msgs, chatMessage{Role: "system", Content: evb.String()})
 		}
-		searchCtx, searchErr := b.searchContextForPrompt(prompt)
-		if searchCtx != "" {
-			msgs = append(msgs, chatMessage{Role: "system", Content: searchCtx})
-			searchStatusText = "🌐 已结合联网搜索\n"
-			if modelKey == "deepseek" {
+		if modelKey == "deepseek" {
+			searchCtx, searchErr := b.searchContextForPrompt(prompt)
+			if searchCtx != "" {
+				msgs = append(msgs, chatMessage{Role: "system", Content: searchCtx})
+				searchStatusText = "🌐 已结合联网搜索\n"
 				msgs = append(msgs, chatMessage{Role: "system", Content: "DeepSeek 联网要求：本轮已提供实时联网搜索摘要。回答时必须结合该摘要；涉及时效性事实时，不要只使用 DeepSeek 训练数据。"})
 				finalUserPrompt = buildDeepSeekPromptWithSearch(prompt, searchCtx)
 				b.appendHistory(userID, "system", "联网搜索结果记忆: "+trimForMemory(searchCtx, 1800))
 				b.appendUserEvent(userID, groupID, "web_search", fmt.Sprintf("问题: %s；结果: %s", trimForMemory(prompt, 200), trimForMemory(searchCtx, 800)))
-			}
-		} else if searchErr != nil {
-			b.logger.Printf("联网搜索摘要生成失败 model=%s user=%s group=%s: %v", modelKey, userID, groupID, searchErr)
-			if modelKey == "deepseek" {
+			} else if searchErr != nil {
+				b.logger.Printf("联网搜索摘要生成失败 model=%s user=%s group=%s: %v", modelKey, userID, groupID, searchErr)
 				msgs = append(msgs, chatMessage{Role: "system", Content: "DeepSeek 联网状态：本轮尝试获取实时联网搜索摘要失败，错误为：" + searchErr.Error() + "。涉及最新信息、新闻、版本、价格、政策、人物或公司状态时，必须明确说明未能成功联网检索，不要假装已使用实时网络资料。"})
 				searchStatusText = "⚠️ 联网搜索失败，DeepSeek 将按未联网状态回答\n"
 			}
