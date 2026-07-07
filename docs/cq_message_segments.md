@@ -160,7 +160,7 @@ Steam 配置：
 - `GEMINI_SEARCH_API_BASE` / `gemini_search_api_base`：gemini-search-mcp 的 OpenAI 兼容接口地址，默认 `http://127.0.0.1:8080`；也可填 `http://127.0.0.1:8080/v1` 或完整 `/v1/chat/completions`
 - `GEMINI_SEARCH_API_KEY` / `gemini_search_api_key`：gemini-search-mcp 不需要真实 API Key；如果你前面套了鉴权网关再填写
 - `GEMINI_SEARCH_MODEL` / `gemini_search_model`：默认 `gemini-search`
-- 配置后任意 AI 模型对话都会自动附加联网搜索摘要，`/deepseek` 也会使用；显式搜索可用 `/search`、`/news`，连通性检查用 `/searchcheck`
+- 配置后 `/deepseek` 会自动附加联网搜索摘要；GPT/Claude/Grok 不自动联网。显式搜索可用 `/search`、`/news`，连通性检查用 `/searchcheck`
 
 60s 聚合 API 配置：
 
