@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	_ "image/gif"
 	"image/jpeg"
 	"image/png"
@@ -31,6 +33,10 @@ import (
 	"unicode"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/math/fixed"
 	"golang.org/x/net/proxy"
 
 	"qq_client/internal/codexcli"
@@ -97,6 +103,7 @@ var (
 	amapAPIKey      = os.Getenv("AMAP_API_KEY")
 	bilibiliAPIBase = envOrDefault("BILIBILI_API_BASE", "https://api.bilibili.com/x/web-interface/view")
 	searxngAPIBase  = envOrDefault("SEARXNG_API_BASE", "")
+	sixtyAPIBase    = envOrDefault("SIXTY_API_BASE", "https://60s.viki.moe")
 
 	// SOCKS5/HTTP 代理（例如 socks5://127.0.0.1:41457 或 http://127.0.0.1:1080）
 	socks5Proxy  = os.Getenv("SOCKS5_PROXY")
@@ -469,6 +476,7 @@ type fileConfig struct {
 	AMapAPIKey           string    `json:"amap_api_key"`
 	BilibiliAPIBase      string    `json:"bilibili_api_base"`
 	SearxngAPIBase       string    `json:"searxng_api_base"`
+	SixtyAPIBase         string    `json:"sixty_api_base"`
 	Socks5Proxy          string    `json:"socks5_proxy"`
 	ProxyEnabled         *bool     `json:"proxy_enabled"`
 }
@@ -580,6 +588,9 @@ func loadConfigFromFile(path string) {
 	}
 	if cfg.SearxngAPIBase != "" {
 		searxngAPIBase = cfg.SearxngAPIBase
+	}
+	if cfg.SixtyAPIBase != "" {
+		sixtyAPIBase = cfg.SixtyAPIBase
 	}
 	if cfg.Socks5Proxy != "" {
 		socks5Proxy = cfg.Socks5Proxy
@@ -1138,7 +1149,7 @@ func (b *qqBotServer) getWeather(cityName string) string {
 }
 
 func (b *qqBotServer) getEpicFreeGames() string {
-	url := "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions?locale=zh-CN&country=CN&allowCountries=CN"
+	url := strings.TrimRight(sixtyAPIBase, "/") + "/v2/epic"
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -1148,68 +1159,37 @@ func (b *qqBotServer) getEpicFreeGames() string {
 	}
 	defer resp.Body.Close()
 	var raw struct {
-		Data struct {
-			Catalog struct {
-				SearchStore struct {
-					Elements []struct {
-						Title       string `json:"title"`
-						ProductSlug string `json:"productSlug"`
-						URLSlug     string `json:"urlSlug"`
-						Promotions  struct {
-							PromotionalOffers []struct {
-								PromotionalOffers []struct {
-									DiscountSetting struct {
-										DiscountPercentage int `json:"discountPercentage"`
-									} `json:"discountSetting"`
-								} `json:"promotionalOffers"`
-							} `json:"promotionalOffers"`
-							UpcomingPromotionalOffers []struct {
-								PromotionalOffers []struct {
-									DiscountSetting struct {
-										DiscountPercentage int `json:"discountPercentage"`
-									} `json:"discountSetting"`
-								} `json:"promotionalOffers"`
-							} `json:"upcomingPromotionalOffers"`
-						} `json:"promotions"`
-					} `json:"elements"`
-				} `json:"searchStore"`
-			} `json:"Catalog"`
+		Code int `json:"code"`
+		Data []struct {
+			Title             string `json:"title"`
+			OriginalPriceDesc string `json:"original_price_desc"`
+			Description       string `json:"description"`
+			Seller            string `json:"seller"`
+			IsFreeNow         bool   `json:"is_free_now"`
+			FreeStart         string `json:"free_start"`
+			FreeEnd           string `json:"free_end"`
+			Link              string `json:"link"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return fmt.Sprintf("❌ Epic查询失败: %v", err)
 	}
-	games := raw.Data.Catalog.SearchStore.Elements
 	freeList := []string{}
-	for _, g := range games {
-		promotions := g.Promotions
-		isFree := false
-		offers := promotions.PromotionalOffers
-		if len(offers) == 0 && len(promotions.UpcomingPromotionalOffers) > 0 {
-			offers = promotions.UpcomingPromotionalOffers
+	for _, g := range raw.Data {
+		if !g.IsFreeNow {
+			continue
 		}
-		for _, promo := range offers {
-			for _, offer := range promo.PromotionalOffers {
-				if offer.DiscountSetting.DiscountPercentage == 0 {
-					isFree = true
-					break
-				}
-			}
-			if isFree {
-				break
-			}
+		line := fmt.Sprintf("🎮 %s", strings.TrimSpace(g.Title))
+		if g.OriginalPriceDesc != "" {
+			line += "\n原价: " + g.OriginalPriceDesc
 		}
-		if isFree {
-			slug := g.ProductSlug
-			if slug == "" {
-				slug = g.URLSlug
-			}
-			link := ""
-			if slug != "" {
-				link = "https://store.epicgames.com/zh-CN/p/" + slug
-			}
-			freeList = append(freeList, fmt.Sprintf("🎮 %s\n🔗 %s", g.Title, link))
+		if g.FreeEnd != "" {
+			line += "\n截止: " + g.FreeEnd
 		}
+		if g.Link != "" {
+			line += "\n🔗 " + g.Link
+		}
+		freeList = append(freeList, line)
 	}
 	if len(freeList) == 0 {
 		return "🎮 当前没有免费游戏"
@@ -1218,6 +1198,164 @@ func (b *qqBotServer) getEpicFreeGames() string {
 		freeList = freeList[:3]
 	}
 	return "🎮 Epic 喜加一:\n\n" + strings.Join(freeList, "\n")
+}
+
+func (b *qqBotServer) getSixtyImage() (string, string) {
+	img, err := b.fetchImageBase64(strings.TrimRight(sixtyAPIBase, "/")+"/v2/60s?encoding=image-proxy", true)
+	if err != nil {
+		return "", "❌ 获取 60s 读懂世界图片失败: " + err.Error()
+	}
+	return img, "🌏 60s 读懂世界"
+}
+
+func (b *qqBotServer) getAINewsImage() (string, string) {
+	apiURL := strings.TrimRight(sixtyAPIBase, "/") + "/v2/ai-news"
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	resp, err := b.externalHTTPClient().Do(req)
+	if err != nil {
+		return "", "❌ 获取 AI 资讯快报失败: " + err.Error()
+	}
+	defer resp.Body.Close()
+	var raw struct {
+		Code int `json:"code"`
+		Data struct {
+			Date string   `json:"date"`
+			News []string `json:"news"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return "", "❌ 解析 AI 资讯快报失败: " + err.Error()
+	}
+	lines := raw.Data.News
+	if len(lines) == 0 {
+		lines = []string{"今日 AI 资讯快报暂无内容。"}
+	}
+	img, err := renderNewsImage("AI 资讯快报", raw.Data.Date, lines)
+	if err != nil {
+		return "", "❌ 生成 AI 资讯快报图片失败: " + err.Error()
+	}
+	return img, "🤖 AI 资讯快报"
+}
+
+func renderNewsImage(title, date string, items []string) (string, error) {
+	const width = 900
+	const margin = 48
+	regular := loadFontFace(24)
+	titleFace := loadFontFace(40)
+	subFace := loadFontFace(20)
+	lineHeight := 36
+	var wrapped []string
+	for i, item := range items {
+		prefix := fmt.Sprintf("%d. ", i+1)
+		for j, line := range wrapText(prefix+strings.TrimSpace(item), regular, width-margin*2) {
+			if j > 0 {
+				line = "   " + line
+			}
+			wrapped = append(wrapped, line)
+		}
+		wrapped = append(wrapped, "")
+	}
+	if len(wrapped) == 0 {
+		wrapped = []string{"暂无内容。"}
+	}
+	height := margin + 62 + 34 + len(wrapped)*lineHeight + margin
+	if height < 520 {
+		height = 520
+	}
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{248, 250, 252, 255}}, image.Point{}, draw.Src)
+	draw.Draw(img, image.Rect(0, 0, width, 120), &image.Uniform{C: color.RGBA{22, 101, 52, 255}}, image.Point{}, draw.Src)
+	drawString(img, titleFace, margin, 62, title, color.RGBA{255, 255, 255, 255})
+	if strings.TrimSpace(date) != "" {
+		drawString(img, subFace, margin, 98, date, color.RGBA{220, 252, 231, 255})
+	}
+	y := 160
+	for _, line := range wrapped {
+		if line == "" {
+			y += lineHeight / 2
+			continue
+		}
+		drawString(img, regular, margin, y, line, color.RGBA{15, 23, 42, 255})
+		y += lineHeight
+	}
+	drawString(img, subFace, margin, height-28, "Powered by 60s API", color.RGBA{100, 116, 139, 255})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", err
+	}
+	return "base64://" + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+func drawString(img *image.RGBA, face font.Face, x, y int, text string, c color.Color) {
+	d := &font.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(c),
+		Face: face,
+		Dot:  fixed.P(x, y),
+	}
+	d.DrawString(text)
+}
+
+func wrapText(text string, face font.Face, maxWidth int) []string {
+	var lines []string
+	var current strings.Builder
+	for _, r := range text {
+		next := current.String() + string(r)
+		if current.Len() > 0 && font.MeasureString(face, next).Ceil() > maxWidth {
+			lines = append(lines, current.String())
+			current.Reset()
+		}
+		current.WriteRune(r)
+	}
+	if strings.TrimSpace(current.String()) != "" {
+		lines = append(lines, current.String())
+	}
+	return lines
+}
+
+func loadFontFace(size float64) font.Face {
+	candidates := []string{
+		os.Getenv("YAQQBOT_FONT"),
+		"/System/Library/Fonts/STHeiti Medium.ttc",
+		"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+		"/Library/Fonts/Arial Unicode.ttf",
+		`C:\Windows\Fonts\msyh.ttc`,
+		`C:\Windows\Fonts\simhei.ttf`,
+		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+	}
+	for _, p := range candidates {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if face, err := faceFromFontBytes(data, size); err == nil {
+			return face
+		}
+	}
+	return basicfont.Face7x13
+}
+
+func faceFromFontBytes(data []byte, size float64) (font.Face, error) {
+	if f, err := opentype.Parse(data); err == nil {
+		return opentype.NewFace(f, &opentype.FaceOptions{Size: size, DPI: 144, Hinting: font.HintingFull})
+	}
+	collection, err := opentype.ParseCollection(data)
+	if err != nil || collection.NumFonts() == 0 {
+		return nil, err
+	}
+	f, err := collection.Font(0)
+	if err != nil {
+		return nil, err
+	}
+	return opentype.NewFace(f, &opentype.FaceOptions{Size: size, DPI: 144, Hinting: font.HintingFull})
 }
 
 func (b *qqBotServer) getBilibiliHotSearch() string {
@@ -3268,6 +3406,8 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 				"/gimg [尺寸] [提示词] - Gemini 图片生成\n" +
 				"/search [关键词]     - SearXNG 联网搜索\n" +
 				"/news [关键词]       - SearXNG 新闻搜索\n" +
+				"/60s                 - 60s 读懂世界图片\n" +
+				"/ainews              - AI 资讯快报图片\n" +
 				"//web [URL]          - 无头浏览器打开网页并截图\n" +
 				"/webcheck            - 检查无头浏览器内核\n" +
 				"/socks on|off|status - 开关外部请求代理\n" +
@@ -3312,6 +3452,10 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			responseText = b.handleSearchCommand(strings.TrimSpace(commandMsg[len("/search "):]), false)
 		case strings.HasPrefix(commandMsg, "/news "):
 			responseText = b.handleSearchCommand(strings.TrimSpace(commandMsg[len("/news "):]), true)
+		case strings.TrimSpace(commandMsg) == "/60s":
+			responseImg, responseText = b.getSixtyImage()
+		case strings.TrimSpace(commandMsg) == "/ainews" || strings.TrimSpace(commandMsg) == "/ai-news":
+			responseImg, responseText = b.getAINewsImage()
 		case strings.HasPrefix(commandMsg, "/img "):
 			p, w, h, err := parseImageCommand(strings.TrimSpace(commandMsg[5:]))
 			if err != nil {

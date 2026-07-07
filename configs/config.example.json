@@ -60,6 +60,9 @@
   // 你的 SearXNG 实例需要开启 JSON 格式输出。
   "searxng_api_base": "https://你的-searxng.example.com",
 
+  // 60s 聚合 API。/epic、/60s、/ainews 会使用这个接口。
+  "sixty_api_base": "https://60s.viki.moe",
+
   "packycode_userinfo_url": "https://codex.packycode.com/api/backend/users/info",
   "packycode_user_jwt": "你的 JWT（如需）",
 
