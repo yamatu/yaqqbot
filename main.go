@@ -2510,7 +2510,6 @@ func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	}
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
-	defer os.Remove(tmpPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -2528,11 +2527,18 @@ func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	if err != nil {
 		return "", fmt.Sprintf("❌ 截图失败: %v %s\n%s", err, strings.TrimSpace(string(out)), browserInstallHint())
 	}
-	pngData, err := os.ReadFile(tmpPath)
-	if err != nil {
-		return "", "❌ 截图失败: " + err.Error()
+	return localImageCQFile(tmpPath), "🌐 页面截图: " + rawURL
+}
+
+func localImageCQFile(path string) string {
+	if len(path) >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+		return "file:///" + strings.ReplaceAll(path, "\\", "/")
 	}
-	return "base64://" + base64.StdEncoding.EncodeToString(pngData), "🌐 页面截图: " + rawURL
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	return "file:///" + filepath.ToSlash(abs)
 }
 
 func findChromeBinary() string {

@@ -123,3 +123,13 @@ func TestForwardMessageTimeout(t *testing.T) {
 		t.Fatalf("timeout should be capped at 90s, got: %s", got)
 	}
 }
+
+func TestLocalImageCQFileUsesFileURI(t *testing.T) {
+	got := localImageCQFile(`C:\Users\yamatu\AppData\Local\Temp\web.png`)
+	if !strings.HasPrefix(got, "file:///") {
+		t.Fatalf("expected file URI, got: %s", got)
+	}
+	if strings.Contains(got, `\`) {
+		t.Fatalf("file URI should use slash separators, got: %s", got)
+	}
+}
