@@ -2,6 +2,11 @@ package main
 
 import (
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -131,5 +136,27 @@ func TestLocalImageCQFileUsesFileURI(t *testing.T) {
 	}
 	if strings.Contains(got, `\`) {
 		t.Fatalf("file URI should use slash separators, got: %s", got)
+	}
+}
+
+func TestIsMostlyBlackPNG(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			img.Set(x, y, color.RGBA{R: 1, G: 1, B: 1, A: 255})
+		}
+	}
+	path := filepath.Join(t.TempDir(), "black.png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if !isMostlyBlackPNG(path) {
+		t.Fatalf("expected black PNG to be detected")
 	}
 }

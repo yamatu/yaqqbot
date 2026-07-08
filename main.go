@@ -2504,20 +2504,41 @@ func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	if bin == "" {
 		return "", "❌ 截图失败: 未找到 Chrome/Chromium 内核。\n" + browserInstallHint()
 	}
+	tmpPath, out, err := runChromeScreenshot(bin, rawURL, "--headless=new")
+	if err != nil {
+		return "", fmt.Sprintf("❌ 截图失败: %v %s\n%s", err, strings.TrimSpace(string(out)), browserInstallHint())
+	}
+	if isMostlyBlackPNG(tmpPath) {
+		_ = os.Remove(tmpPath)
+		retryPath, retryOut, retryErr := runChromeScreenshot(bin, rawURL, "--headless")
+		if retryErr != nil {
+			return "", fmt.Sprintf("❌ 截图失败: %v %s\n%s", retryErr, strings.TrimSpace(string(retryOut)), browserInstallHint())
+		}
+		tmpPath = retryPath
+	}
+	return localImageCQFile(tmpPath), "🌐 页面截图: " + rawURL
+}
+
+func runChromeScreenshot(bin, rawURL, headlessArg string) (string, []byte, error) {
 	tmp, err := os.CreateTemp("", "yaqqbot-web-*.png")
 	if err != nil {
-		return "", "❌ 截图失败: " + err.Error()
+		return "", nil, err
 	}
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	args := []string{
-		"--headless=new",
+		headlessArg,
 		"--disable-gpu",
+		"--disable-software-rasterizer=false",
+		"--disable-dev-shm-usage",
 		"--no-sandbox",
 		"--hide-scrollbars",
+		"--force-color-profile=srgb",
+		"--run-all-compositor-stages-before-draw",
+		"--virtual-time-budget=5000",
 		"--window-size=1365,900",
 		"--screenshot=" + tmpPath,
 		rawURL,
@@ -2525,9 +2546,38 @@ func (b *qqBotServer) captureWebScreenshot(rawURL string) (string, string) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Sprintf("❌ 截图失败: %v %s\n%s", err, strings.TrimSpace(string(out)), browserInstallHint())
+		_ = os.Remove(tmpPath)
+		return "", out, err
 	}
-	return localImageCQFile(tmpPath), "🌐 页面截图: " + rawURL
+	return tmpPath, out, nil
+}
+
+func isMostlyBlackPNG(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		return false
+	}
+	bounds := img.Bounds()
+	total := 0
+	dark := 0
+	for y := bounds.Min.Y; y < bounds.Max.Y; y += 8 {
+		for x := bounds.Min.X; x < bounds.Max.X; x += 8 {
+			r, g, b, a := img.At(x, y).RGBA()
+			if a == 0 {
+				continue
+			}
+			total++
+			if r>>8 < 12 && g>>8 < 12 && b>>8 < 12 {
+				dark++
+			}
+		}
+	}
+	return total > 0 && float64(dark)/float64(total) > 0.98
 }
 
 func localImageCQFile(path string) string {
