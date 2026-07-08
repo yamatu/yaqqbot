@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCompactChatMessagesPreservesLeadingSystemSearchContext(t *testing.T) {
@@ -111,5 +112,14 @@ data: [DONE]
 	}
 	if got != "**结论**：可以使用。" {
 		t.Fatalf("unexpected stream content: %q", got)
+	}
+}
+
+func TestForwardMessageTimeout(t *testing.T) {
+	if got := forwardMessageTimeout(1); got != 33*time.Second {
+		t.Fatalf("unexpected timeout for one node: %s", got)
+	}
+	if got := forwardMessageTimeout(100); got != 90*time.Second {
+		t.Fatalf("timeout should be capped at 90s, got: %s", got)
 	}
 }

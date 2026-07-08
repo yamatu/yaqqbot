@@ -3454,6 +3454,14 @@ func splitTextBySize(text string, size int) []string {
 	return parts
 }
 
+func forwardMessageTimeout(nodeCount int) time.Duration {
+	timeout := 30*time.Second + time.Duration(nodeCount)*3*time.Second
+	if timeout > 90*time.Second {
+		return 90 * time.Second
+	}
+	return timeout
+}
+
 func (b *qqBotServer) sendForwardMessage(client *wsClient, messageType string, targetID int64, text string, selfID int64) error {
 	if messageType != "group" && messageType != "private" {
 		return errors.New("unsupported message type")
@@ -3488,7 +3496,7 @@ func (b *qqBotServer) sendForwardMessage(client *wsClient, messageType string, t
 			"messages": nodes,
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), forwardMessageTimeout(len(nodes)))
 	defer cancel()
 	_, err := client.Call(ctx, action, params)
 	return err
@@ -3502,7 +3510,11 @@ func (b *qqBotServer) sendLongText(client *wsClient, messageType string, targetI
 		if err := b.sendForwardMessage(client, messageType, targetID, text, selfID); err == nil {
 			return
 		} else {
-			b.logger.Printf("合并转发失败，不回退发送原始长文本，避免重复刷屏: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				b.logger.Printf("合并转发等待回包超时，消息可能已发送成功；不回退发送原始长文本，避免重复刷屏: %v", err)
+			} else {
+				b.logger.Printf("合并转发失败，不回退发送原始长文本，避免重复刷屏: %v", err)
+			}
 			return
 		}
 	}
