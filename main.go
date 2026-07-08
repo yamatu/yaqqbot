@@ -3502,7 +3502,8 @@ func (b *qqBotServer) sendLongText(client *wsClient, messageType string, targetI
 		if err := b.sendForwardMessage(client, messageType, targetID, text, selfID); err == nil {
 			return
 		} else {
-			b.logger.Printf("合并转发失败，回退分段发送: %v", err)
+			b.logger.Printf("合并转发失败，不回退发送原始长文本，避免重复刷屏: %v", err)
+			return
 		}
 	}
 	for start := 0; start < len(text); start += messageChunkSize {
