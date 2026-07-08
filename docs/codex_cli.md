@@ -8,8 +8,12 @@
 
 这意味着它**不支持**被普通 HTTP 客户端（你的 Go 程序）直接调用。
 
-本项目已做适配：当检测到 `gpt_api_base/GPT_API_BASE` 指向 `codex-api.packycode.com` 时，
-程序会自动改为调用本机官方 **Codex CLI**（`codex exec`）来完成对话，从而合法使用该中转。
+本项目已做适配：当你显式开启 `gpt_use_codex_cli/GPT_USE_CODEX_CLI`，并且
+`gpt_api_base/GPT_API_BASE` 指向 `codex-api.packycode.com` 时，程序会调用本机官方
+**Codex CLI**（`codex exec`）来完成对话，从而合法使用该中转。
+
+注意：Codex CLI 是完整代理运行方式，普通 QQ 闲聊默认禁用该路径。否则一句短问也可能带来
+明显高于普通 Chat Completions 的上下文和代理开销。
 
 ## 兼容说明（重要）
 
@@ -48,6 +52,7 @@
 3. 在你的 `configs/config.json` 中保持（或设置）：
    - `gpt_api_base`: `https://codex-api.packycode.com/v1`
    - `gpt_api_key`: 你的中转 Key（程序会把它注入给 Codex CLI 使用）
+   - `gpt_use_codex_cli`: `true`
 4. 启动
    - `go run .`
    - 或 `go run main.go`
@@ -57,6 +62,7 @@
 - `CODEX_CLI_BIN`：指定 Codex CLI 可执行文件名/路径（默认 `codex`）
 - `CODEX_WIRE_API`：Codex CLI 使用的底层接口类型（默认 `responses`，必要时可改为 `chat`）
 - `CODEX_SKIP_GIT_REPO_CHECK`：是否追加 `--skip-git-repo-check`（默认开启；设为 `0/false/off` 可关闭）
+- `GPT_USE_CODEX_CLI`：是否允许 GPT 普通聊天走 Codex CLI（默认关闭）
 
 ## Windows 说明
 
