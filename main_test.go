@@ -1,16 +1,55 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func restoreGPTGlobals(t *testing.T) {
+	t.Helper()
+	oldAPIKey := gptAPIKey
+	oldAPIBase := gptAPIBase
+	oldModel := gptModel
+	oldUseResponses := gptUseResponses
+	oldUseCodexCLI := gptUseCodexCLI
+	oldMaxOutputTokens := gptMaxOutputTokens
+	oldMaxContextChars := gptMaxContextChars
+	oldMaxContext := maxContextChars
+	t.Cleanup(func() {
+		gptAPIKey = oldAPIKey
+		gptAPIBase = oldAPIBase
+		gptModel = oldModel
+		gptUseResponses = oldUseResponses
+		gptUseCodexCLI = oldUseCodexCLI
+		gptMaxOutputTokens = oldMaxOutputTokens
+		gptMaxContextChars = oldMaxContextChars
+		maxContextChars = oldMaxContext
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func jsonResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
 
 func TestCompactChatMessagesPreservesLeadingSystemSearchContext(t *testing.T) {
 	messages := []chatMessage{
@@ -117,6 +156,95 @@ data: [DONE]
 	}
 	if got != "**结论**：可以使用。" {
 		t.Fatalf("unexpected stream content: %q", got)
+	}
+}
+
+func TestGPTDefaultsUseSingleChatCompletionRequest(t *testing.T) {
+	restoreGPTGlobals(t)
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/v1/chat/completions" {
+			return jsonResponse(http.StatusNotFound, `{"error":"unexpected path"}`), nil
+		}
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return jsonResponse(http.StatusBadRequest, `{"error":"bad json"}`), err
+		}
+		maxTokens, ok := req["max_tokens"].(float64)
+		if !ok {
+			t.Errorf("missing numeric max_tokens: %#v", req["max_tokens"])
+		} else if got := int(maxTokens); got != 321 {
+			t.Errorf("unexpected max_tokens: %d", got)
+		}
+		if _, ok := req["max_output_tokens"]; ok {
+			t.Errorf("chat completions request should not include max_output_tokens")
+		}
+		return jsonResponse(http.StatusOK, `{"choices":[{"message":{"role":"assistant","content":"你好"}}]}`), nil
+	})}
+
+	gptAPIKey = "test-key"
+	gptAPIBase = "https://example.test/v1"
+	gptModel = "gpt-test"
+	gptUseResponses = false
+	gptUseCodexCLI = false
+	gptMaxOutputTokens = 321
+
+	b := &qqBotServer{httpClient: client}
+	if got := b.callGPTAPI([]chatMessage{{Role: "user", Content: "你好"}}); got != "你好" {
+		t.Fatalf("unexpected answer: %s", got)
+	}
+	if len(paths) != 1 || paths[0] != "/v1/chat/completions" {
+		t.Fatalf("expected exactly one chat completions request, got %#v", paths)
+	}
+}
+
+func TestGPTResponsesDoesNotFallbackToChatCompletions(t *testing.T) {
+	restoreGPTGlobals(t)
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		return jsonResponse(http.StatusNotFound, `{"error":"responses unsupported"}`), nil
+	})}
+
+	gptAPIKey = "test-key"
+	gptAPIBase = "https://example.test/v1"
+	gptModel = "gpt-test"
+	gptUseResponses = true
+	gptMaxOutputTokens = 456
+
+	b := &qqBotServer{httpClient: client}
+	got := b.callGPTAPI([]chatMessage{{Role: "user", Content: "你好"}})
+	if !strings.Contains(got, "禁止自动回退") {
+		t.Fatalf("expected no-fallback warning, got: %s", got)
+	}
+	if len(paths) != 1 || paths[0] != "/v1/responses" {
+		t.Fatalf("expected exactly one responses request, got %#v", paths)
+	}
+}
+
+func TestGPTCodexCLIDisabledByDefault(t *testing.T) {
+	restoreGPTGlobals(t)
+	gptAPIKey = "test-key"
+	gptAPIBase = "https://codex-api.packycode.com/v1"
+	gptUseCodexCLI = false
+
+	b := &qqBotServer{httpClient: http.DefaultClient}
+	got := b.callGPTAPI([]chatMessage{{Role: "user", Content: "你好"}})
+	if !strings.Contains(got, "默认禁止自动使用 Codex CLI") {
+		t.Fatalf("expected codex cli guard, got: %s", got)
+	}
+}
+
+func TestContextLimitForGPTUsesGPTSpecificLimit(t *testing.T) {
+	restoreGPTGlobals(t)
+	maxContextChars = 24000
+	gptMaxContextChars = 8000
+	if got := contextLimitForModel("gpt"); got != 8000 {
+		t.Fatalf("unexpected gpt context limit: %d", got)
+	}
+	if got := contextLimitForModel("grok"); got != 24000 {
+		t.Fatalf("unexpected non-gpt context limit: %d", got)
 	}
 }
 

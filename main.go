@@ -74,9 +74,13 @@ var (
 	gptAPIKey = os.Getenv("GPT_API_KEY")
 	// OpenAI 官方接口通常为 https://api.openai.com/v1
 	// 注意：不要填写成 https://api.openai.com/v1/codex（这是 Codex CLI 专用前缀）
-	gptAPIBase    = envOrDefault("GPT_API_BASE", "https://api.openai.com/v1")
-	gptModel      = envOrDefault("GPT_MODEL", "gpt-5.1")
-	gptImageModel = envOrDefault("GPT_IMAGE_MODEL", "gpt-image-2")
+	gptAPIBase         = envOrDefault("GPT_API_BASE", "https://api.openai.com/v1")
+	gptModel           = envOrDefault("GPT_MODEL", "gpt-5.1")
+	gptImageModel      = envOrDefault("GPT_IMAGE_MODEL", "gpt-image-2")
+	gptUseResponses    = envBoolOrDefault("GPT_USE_RESPONSES", false)
+	gptUseCodexCLI     = envBoolOrDefault("GPT_USE_CODEX_CLI", false)
+	gptMaxOutputTokens = envIntOrDefault("GPT_MAX_OUTPUT_TOKENS", 1200)
+	gptMaxContextChars = envIntOrDefault("GPT_MAX_CONTEXT_CHARS", 8000)
 
 	grokAPIKey  = os.Getenv("GROK_API_KEY")
 	grokAPIBase = envOrDefault("GROK_API_BASE", "https://happyapi.org/v1")
@@ -458,6 +462,10 @@ type fileConfig struct {
 	GPTAPIBase           string    `json:"gpt_api_base"`
 	GPTModel             string    `json:"gpt_model"`
 	GPTImageModel        string    `json:"gpt_image_model"`
+	GPTUseResponses      *bool     `json:"gpt_use_responses"`
+	GPTUseCodexCLI       *bool     `json:"gpt_use_codex_cli"`
+	GPTMaxOutputTokens   int       `json:"gpt_max_output_tokens"`
+	GPTMaxContextChars   int       `json:"gpt_max_context_chars"`
 	GrokAPIKey           string    `json:"grok_api_key"`
 	GrokAPIBase          string    `json:"grok_api_base"`
 	GrokModel            string    `json:"grok_model"`
@@ -528,6 +536,18 @@ func loadConfigFromFile(path string) {
 	}
 	if cfg.GPTImageModel != "" {
 		gptImageModel = cfg.GPTImageModel
+	}
+	if cfg.GPTUseResponses != nil {
+		gptUseResponses = *cfg.GPTUseResponses
+	}
+	if cfg.GPTUseCodexCLI != nil {
+		gptUseCodexCLI = *cfg.GPTUseCodexCLI
+	}
+	if cfg.GPTMaxOutputTokens > 0 {
+		gptMaxOutputTokens = cfg.GPTMaxOutputTokens
+	}
+	if cfg.GPTMaxContextChars > 0 {
+		gptMaxContextChars = cfg.GPTMaxContextChars
 	}
 	if cfg.GrokAPIKey != "" {
 		grokAPIKey = cfg.GrokAPIKey
@@ -2642,16 +2662,37 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
+func gptOutputTokenLimit() int {
+	if gptMaxOutputTokens <= 0 {
+		return 1200
+	}
+	return gptMaxOutputTokens
+}
+
+func contextLimitForModel(modelKey string) int {
+	if modelKey == "gpt" && gptMaxContextChars > 0 {
+		return gptMaxContextChars
+	}
+	return maxContextChars
+}
+
 func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 	if gptAPIKey == "" {
 		return "❌ GPT 未配置 API Key"
 	}
 	apiBase := openaiutil.NormalizeAPIBase(gptAPIBase)
 	origin := openaiutil.OriginFromAPIBase(apiBase)
+	maxOut := gptOutputTokenLimit()
 
 	// 特殊处理：codex-api.packycode.com 明确限制“仅允许官方 Codex CLI 访问”。
-	// 这里不尝试伪装/绕过，而是直接调用本机 Codex CLI 来完成对话（需要你已安装并登录/配置）。
+	// Codex CLI 是完整代理运行方式，普通聊天默认禁用，避免一次短问消耗大量代理上下文额度。
 	if strings.Contains(strings.ToLower(apiBase), "codex-api.packycode.com") {
+		if !gptUseCodexCLI {
+			return "❌ GPT 当前配置的是 codex-api.packycode.com（Codex CLI 专用入口）。\n" +
+				"为避免普通聊天触发高消耗 Codex 代理调用，已默认禁止自动使用 Codex CLI。\n" +
+				"建议把 gpt_api_base 改成普通 OpenAI 兼容地址（例如 https://api.openai.com/v1 或你的中转 /v1）。\n" +
+				"如果你确认要用 Codex CLI，请在配置里显式设置 gpt_use_codex_cli: true。"
+		}
 		prompt := buildConversationPrompt(messages)
 		out, err := codexcli.Exec(context.Background(), prompt, codexcli.ExecOptions{
 			Bin:     envOrDefault("CODEX_CLI_BIN", "codex"),
@@ -2673,13 +2714,12 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 		return out
 	}
 
-	// 优先尝试 OpenAI 新版 /v1/responses（Codex CLI、gpt-5.* 等模型通常走该接口）。
-	{
+	if gptUseResponses {
 		url := apiBase + "/responses"
 		reqBody := map[string]any{
 			"model":             gptModel,
 			"input":             messages,
-			"max_output_tokens": 4000,
+			"max_output_tokens": maxOut,
 		}
 		data, _ := json.Marshal(reqBody)
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -2701,39 +2741,22 @@ func (b *qqBotServer) callGPTAPI(messages []chatMessage) string {
 			if out := openaiutil.ExtractResponsesOutputText(body); out != "" {
 				return out
 			}
-			// 兼容实现差异：如果解析不到 output_text，就把原始响应作为错误回显，方便定位。
 			return "❌ GPT 返回结构无法解析（/responses）"
 		}
-
-		// 如果服务端不支持 /responses，则回退到 /chat/completions（兼容 OpenAI-compat 接口）。
-		// 常见不支持情况：404 / 405 / 未实现；其他错误则直接返回，避免掩盖真实问题。
-		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
-			errText := strings.TrimSpace(string(body))
-			// 这个报错通常意味着 API Base 填成了 /v1/codex（Codex CLI 专用），或者指向了仅允许 Codex CLI 的代理。
-			if strings.Contains(errText, "only accessible via the official Codex CLI") {
-				// 说明：
-				// - codex-api.packycode.com 往往是给 Codex CLI 用的专用入口（可能会拒绝普通 HTTP 客户端）
-				// - 想走 OpenAI 官方：用 https://api.openai.com/v1
-				// - 想走 Packy 中转：通常应使用其对外的 OpenAI 兼容 /v1 根地址，而不是 codex-api 专用入口
-				msg := "❌ GPT 端点权限不足：该接口仅允许官方 Codex CLI 访问。\n"
-				if strings.Contains(strings.ToLower(gptAPIBase), "codex-api.packycode.com") {
-					msg += "你当前配置的是 codex-api.packycode.com（Codex CLI 专用）。\n" +
-						"如果你要用 Packy 中转，请把 GPT_API_BASE / gpt_api_base 改为 https://www.packyapi.com/v1 再试。\n"
-				}
-				msg += "如果你要直连 OpenAI 官方，请改为 https://api.openai.com/v1（不要带 /codex）。"
-				return msg
-			}
-			return fmt.Sprintf("GPT API Error: %d %s", resp.StatusCode, errText)
+		errText := strings.TrimSpace(string(body))
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			return fmt.Sprintf("❌ GPT Responses API 不可用: %d %s\n当前已禁止自动回退到 Chat Completions，避免一次提问产生第二次计费请求。请把 gpt_use_responses 设为 false，或改用支持 /responses 的接口。", resp.StatusCode, errText)
 		}
+		return fmt.Sprintf("GPT API Error: %d %s", resp.StatusCode, errText)
 	}
 
-	// 回退：旧版 /v1/chat/completions
+	// 默认走 OpenAI 兼容 /v1/chat/completions。不要先试 /responses 再回退，避免中转站按请求扣双倍额度。
 	{
 		url := apiBase + "/chat/completions"
 		reqBody := map[string]any{
 			"model":      gptModel,
 			"messages":   messages,
-			"max_tokens": 4000,
+			"max_tokens": maxOut,
 		}
 		data, _ := json.Marshal(reqBody)
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -4044,7 +4067,7 @@ func (b *qqBotServer) processSingleMessage(client *wsClient, payload []byte) {
 			msgs = append(msgs, chatMessage{Role: h.Role, Content: h.Content})
 		}
 		msgs = append(msgs, chatMessage{Role: "user", Content: finalUserPrompt})
-		msgs = compactChatMessages(msgs, maxContextChars)
+		msgs = compactChatMessages(msgs, contextLimitForModel(modelKey))
 		var ans string
 		switch modelKey {
 		case "claude":

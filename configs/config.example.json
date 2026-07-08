@@ -20,9 +20,19 @@
   "claude_model": "claude-sonnet-4-5-20250929",
 
   "gpt_api_key": "YOUR_GPT_API_KEY",
-  "gpt_api_base": "https://codex-api.packycode.com/v1",
+  // GPT 对话默认走普通 OpenAI 兼容 /v1/chat/completions，避免一次消息先试 Responses 再回退造成双请求扣费。
+  // 官方 OpenAI 可填 "https://api.openai.com/v1"；中转站请填它提供的 OpenAI 兼容 /v1 根地址。
+  // 不要把普通聊天默认配置成 codex-api.packycode.com；那是 Codex CLI 专用入口，消耗通常更高。
+  "gpt_api_base": "https://api.openai.com/v1",
   "gpt_model": "gpt-5.1",
   "gpt_image_model": "gpt-image-2",
+  // 仅当你的 GPT 接口明确要求 /v1/responses 时开启；开启后也不会自动回退二次请求。
+  "gpt_use_responses": false,
+  // 仅当你明确要用 Codex CLI 代理方式访问 codex-api.packycode.com 时开启。
+  "gpt_use_codex_cli": false,
+  // 防止闲聊携带过长历史或申请过大输出额度。需要长文时再按需调大。
+  "gpt_max_context_chars": 8000,
+  "gpt_max_output_tokens": 1200,
 
   "grok_api_key": "YOUR_GROK_API_KEY",
   "grok_api_base": "https://happyapi.org/v1",
@@ -45,7 +55,7 @@
   "steam_monitor_groups": ["123456789"],
   "steam_poll_interval": "60s",
 
-  // 超过该字符数的回复优先用合并转发折叠；失败时自动回退分段发送。
+  // 超过该字符数的回复优先用合并转发折叠；失败时不再回退直发原始长文本，避免重复刷屏。
   "long_forward_threshold": 3000,
 
   // agent 调用模型前的最大上下文字符数，超过会折叠较早历史。
